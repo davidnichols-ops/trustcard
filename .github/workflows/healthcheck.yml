@@ -1,0 +1,65 @@
+name: MCP Trustcard
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"  # daily drift detection
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm test
+
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: "@modelcontextprotocol/server-memory"
+            slug: memory
+          - server: "@modelcontextprotocol/server-filesystem"
+            slug: filesystem
+          - server: "@modelcontextprotocol/server-github"
+            slug: github
+          - server: "@modelcontextprotocol/server-puppeteer"
+            slug: puppeteer
+          - server: "@modelcontextprotocol/server-brave-search"
+            slug: brave-search
+          - server: "@playwright/mcp"
+            slug: playwright
+          - server: "@upstash/context7-mcp"
+            slug: context7
+          - server: "chrome-devtools-mcp"
+            slug: chrome-devtools
+          - server: "@storybook/mcp"
+            slug: storybook
+          - server: "@eslint/mcp"
+            slug: eslint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Healthcheck ${{ matrix.slug }}
+        run: |
+          npx -y mcp-trustcard@latest --json "${{ matrix.server }}" > report.json 2>/dev/null || true
+          npx -y mcp-trustcard@latest "${{ matrix.server }}" || true
+          score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('report.json','utf8')).score)}catch{console.log(0)}")
+          echo "Score: $score (min: 40)"
+          if [ "$score" -lt 40 ]; then
+            echo "::error::MCP server ${{ matrix.server }} scored $score, below minimum 40"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.slug }}
+          path: report.json

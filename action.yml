@@ -1,0 +1,59 @@
+name: "MCP Trustcard"
+description: "Run a trust-card healthcheck against any MCP server in CI. Scores installability, protocol handshake, tool schemas, destructive capabilities, auth, secret exposure, protocol version, and latency. Fails the job when the score drops below a threshold."
+branding:
+  icon: "shield"
+  color: "green"
+inputs:
+  server:
+    description: "npm package spec of the MCP server to scan (e.g. @modelcontextprotocol/server-github)"
+    required: true
+  min-score:
+    description: "Minimum score (0-100) required to pass. Default 50."
+    required: false
+    default: "50"
+  json-out:
+    description: "Path to write the JSON report. Optional."
+    required: false
+    default: ""
+  save-manifest:
+    description: "Path to save a tool manifest for proxy enforcement. Optional. Generates a manifest JSON with tool names + schema hashes that mcp-proxy can enforce at call time."
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Run mcp-trustcard
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Single scan — capture JSON and print text report
+        npx -y mcp-trustcard@latest --json "${{ inputs.server }}" > report.json 2>/dev/null || true
+        npx -y mcp-trustcard@latest "${{ inputs.server }}" || true
+
+        # Extract score from the JSON report
+        score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('report.json','utf8')).score)}catch{console.log(0)}")
+        echo "Score: $score (min: ${{ inputs.min-score }})"
+
+        # Save JSON report if requested
+        if [ -n "${{ inputs.json-out }}" ]; then
+          cp report.json "${{ inputs.json-out }}"
+          echo "Report saved to ${{ inputs.json-out }}"
+        fi
+
+        # Generate manifest if requested
+        if [ -n "${{ inputs.save-manifest }}" ]; then
+          npx -y mcp-trustcard@latest scan "${{ inputs.server }}" --save-manifest "${{ inputs.save-manifest }}"
+          echo "Manifest saved to ${{ inputs.save-manifest }}"
+        fi
+
+        # Fail if below threshold
+        if [ "$score" -lt "${{ inputs.min-score }}" ]; then
+          echo "::error::MCP server ${{ inputs.server }} scored $score, below minimum ${{ inputs.min-score }}"
+          exit 1
+        fi

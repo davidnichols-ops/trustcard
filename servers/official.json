@@ -1,0 +1,12 @@
+[
+  "@modelcontextprotocol/server-memory",
+  "@modelcontextprotocol/server-filesystem",
+  "@modelcontextprotocol/server-github",
+  "@modelcontextprotocol/server-puppeteer",
+  "@modelcontextprotocol/server-brave-search",
+  "@playwright/mcp",
+  "@upstash/context7-mcp",
+  "chrome-devtools-mcp",
+  "@storybook/mcp",
+  "@eslint/mcp"
+]

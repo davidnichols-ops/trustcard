@@ -1,0 +1,41 @@
+{
+  "name": "mcp-trustcard",
+  "version": "0.3.0",
+  "description": "The \"npm audit\" for MCP servers — a public trust card for every Model Context Protocol server.",
+  "type": "module",
+  "bin": {
+    "mcp-trustcard": "bin/mcp-trustcard.js",
+    "mcp-proxy": "bin/mcp-proxy.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "test"
+  ],
+  "scripts": {
+    "scan:all": "node bin/mcp-trustcard.js --batch servers/official.json --json-out results.json",
+    "test": "node --test test/manifest.test.js test/proxy.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "audit",
+    "healthcheck",
+    "trust",
+    "agents"
+  ],
+  "license": "MIT",
+  "author": "davidnichols-ops",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/davidnichols-ops/trustcard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/davidnichols-ops/trustcard/issues"
+  },
+  "homepage": "https://github.com/davidnichols-ops/trustcard#readme",
+  "engines": {
+    "node": ">=18"
+  }
+}
