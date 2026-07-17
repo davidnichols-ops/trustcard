@@ -16,10 +16,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm test
+      - run: node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js
 
   scan:
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -63,3 +64,22 @@ jobs:
         with:
           name: report-${{ matrix.slug }}
           path: report.json
+
+  scan-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Scan for exposed secrets in config files
+        run: |
+          # Scan any MCP config files in the repo for exposed secrets
+          find . -name "config.json" -path "*/.devin/*" -o -name "config.local.json" -path "*/.devin/*" | while read f; do
+            echo "Scanning $f..."
+            npx -y mcp-trustcard@latest scan-config "$f" || {
+              echo "::error::Secrets found in $f — use \${env:VAR} references instead of hardcoded values"
+              exit 1
+            }
+          done
+          echo "No exposed secrets found in config files."

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // mcp-trustcard — the "npm audit" for MCP servers.
 import { runHealthcheck } from "../lib/checks.js";
+import { scanConfigForSecrets } from "../lib/checks.js";
 import { buildManifest } from "../lib/manifest.js";
 import { McpStdioClient, PROTOCOL_VERSIONS } from "../lib/client.js";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -19,10 +20,11 @@ Usage:
   mcp-trustcard --json <spec>              # machine-readable single report
   mcp-trustcard scan <spec> --save-manifest <file>   # scan + save tool manifest
   mcp-trustcard scan -- <cmd> [args...] --save-manifest <file>  # local cmd manifest
+  mcp-trustcard scan-config <config.json>   # scan MCP config for exposed secrets
 
 Examples:
   npx mcp-trustcard @modelcontextprotocol/server-github
-  mcp-trustcard -- uv run maos mcp serve          # scan a local Python server
+  mcp-trustcard --env-file .env -- uv run maos mcp serve  # inject env vars
   mcp-trustcard --batch servers/official.json --json-out results.json
   mcp-trustcard scan @modelcontextprotocol/server-memory --save-manifest memory.json
   mcp-trustcard scan -- uv run maos mcp serve --save-manifest maos.json
@@ -33,10 +35,31 @@ Options:
   --json-out <file>   write batch results as JSON
   --json              emit single report as JSON instead of text
   --save-manifest <file>  save approved tool manifest (for proxy enforcement)
+  --env-file <file>   load env vars from a .env file (KEY=value lines) and inject into the scanned server
   --cwd <dir>         working directory for local command (use with -- <cmd>)
   --no-color          disable ANSI colors
   -h, --help          show this help
 `);
+}
+
+// Parse a .env file and return a map of KEY -> value
+function parseEnvFile(path) {
+  const text = readFileSync(path, "utf8");
+  const env = {};
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    let val = trimmed.slice(eqIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    env[key] = val;
+  }
+  return env;
 }
 
 // Parse a -- separator from args, returning everything after it as cmd + args.
@@ -53,7 +76,7 @@ function parseLocalCommand(argList) {
 // Generate a tool manifest by connecting to the server, listing tools,
 // and hashing their schemas. Used by the proxy for call-time enforcement.
 // spec can be a string (npm) or { cmd, args, spec? } (local command).
-async function generateManifest(spec, outFile) {
+async function generateManifest(spec, outFile, env = {}) {
   const isLocal = typeof spec === "object" && spec !== null;
   let cmd, args, specStr, cwd;
 
@@ -63,7 +86,17 @@ async function generateManifest(spec, outFile) {
     specStr = spec.spec ?? `${cmd} ${args.join(" ")}`;
     cwd = spec.cwd;
   } else {
-    const { stdout } = await exec(`npm view ${JSON.stringify(spec)} name version bin --json`, {
+    // Try to find a working npm — the mise-managed npm may be broken
+    const npmCandidates = ["npm", "/opt/homebrew/bin/npm", "/usr/local/bin/npm"];
+    let npmBin = "npm";
+    for (const candidate of npmCandidates) {
+      try {
+        await exec(`${candidate} --version`, { timeout: 5_000, env: process.env });
+        npmBin = candidate;
+        break;
+      } catch {}
+    }
+    const { stdout } = await exec(`${npmBin} view ${JSON.stringify(spec)} name version bin --json`, {
       timeout: 30_000, env: process.env,
     });
     JSON.parse(stdout); // verify it resolves
@@ -74,7 +107,7 @@ async function generateManifest(spec, outFile) {
 
   const client = new McpStdioClient({
     cmd, args,
-    env: {},
+    env,
     spawnTimeout: 45_000,
     cwd,
   });
@@ -160,6 +193,42 @@ async function main() {
   const cwdIdx = args.indexOf("--cwd");
   const cwd = cwdIdx !== -1 && args[cwdIdx + 1] ? args[cwdIdx + 1] : undefined;
 
+  // Parse --env-file <file>
+  const envFileIdx = args.indexOf("--env-file");
+  let injectedEnv = {};
+  if (envFileIdx !== -1 && args[envFileIdx + 1]) {
+    const envFile = args[envFileIdx + 1];
+    if (!existsSync(envFile)) {
+      console.error(`--env-file: file not found: ${envFile}`);
+      process.exit(2);
+    }
+    injectedEnv = parseEnvFile(envFile);
+    process.stderr.write(`Loaded ${Object.keys(injectedEnv).length} env var(s) from ${envFile}\n`);
+  }
+
+  // scan-config subcommand: scan an MCP config file for exposed secrets
+  if (args[0] === "scan-config") {
+    const configArg = args[1];
+    if (!configArg || !existsSync(configArg)) {
+      console.error("scan-config: missing <config-file> or file not found");
+      console.error("Usage: mcp-trustcard scan-config <path-to-config.json>");
+      process.exit(2);
+    }
+    const configText = readFileSync(configArg, "utf8");
+    const findings = scanConfigForSecrets(configText, configArg);
+    if (findings.length === 0) {
+      console.log(`${green("PASS")} No secrets detected in ${configArg}`);
+      process.exit(0);
+    } else {
+      console.log(`${red("FAIL")} ${findings.length} potential secret(s) found in ${configArg}:`);
+      for (const f of findings) {
+        console.log(`  ${yellow("line " + f.line)} key=${bold(f.key)} pattern=${f.pattern}`);
+        console.log(`    ${dim(f.sample)}`);
+      }
+      process.exit(1);
+    }
+  }
+
   // scan subcommand: generate a tool manifest for proxy enforcement
   if (args[0] === "scan") {
     let scanArgs = args.slice(1);
@@ -180,14 +249,14 @@ async function main() {
     const local = parseLocalCommand(scanArgs);
     if (local) {
       if (cwd) local.cwd = cwd;
-      await generateManifest(local, outFile);
+      await generateManifest(local, outFile, injectedEnv);
       return;
     }
 
     // Otherwise: npm spec
     const spec = scanArgs.find((a) => !a.startsWith("-") && a !== "scan");
     if (!spec) { console.error("scan: missing <spec> or -- <cmd> [args...]"); process.exit(2); }
-    await generateManifest(spec, outFile);
+    await generateManifest(spec, outFile, injectedEnv);
     return;
   }
 
@@ -237,15 +306,15 @@ async function main() {
   const local = parseLocalCommand(args);
   if (local) {
     if (cwd) local.cwd = cwd;
-    const r = await runHealthcheck(local);
+    const r = await runHealthcheck(local, { env: injectedEnv });
     if (jsonFlag) console.log(JSON.stringify(r, null, 2));
     else printReport(r);
     process.exit(r.score >= 50 ? 0 : 1);
   }
 
-  const spec = args.find((a) => !a.startsWith("-"));
+  const spec = args.find((a) => !a.startsWith("-") && a !== (envFileIdx !== -1 ? args[envFileIdx + 1] : null));
   if (!spec) return usage();
-  const r = await runHealthcheck(spec);
+  const r = await runHealthcheck(spec, { env: injectedEnv });
   if (jsonFlag) console.log(JSON.stringify(r, null, 2));
   else printReport(r);
   process.exit(r.score >= 50 ? 0 : 1);

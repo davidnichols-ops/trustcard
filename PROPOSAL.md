@@ -89,13 +89,15 @@ This alone would have let 4 of the 10 servers in our scan tell clients *why* the
 
 A scan is a snapshot. Server tool definitions can drift after approval — new tools added, schemas changed, rogue tools injected. The registry can declare health, but clients need enforcement at call time to catch drift.
 
-`mcp-trustcard` ships with a **stdio proxy** (`mcp-proxy`) that closes this gap:
+`mcp-trustcard` ships with **two proxies** that close this gap:
+
+### stdio proxy (`mcp-proxy`)
+
+For local MCP servers that communicate over stdio JSON-RPC:
 
 1. **Scan generates a manifest** — tool names + SHA-256 schema hashes, saved as JSON.
 2. **Proxy sits between client and server** — intercepts `tools/list` and `tools/call`, compares against the manifest.
 3. **Unapproved tools are stripped** from `tools/list` responses. **Calls to unapproved tools are blocked** with a JSON-RPC error before reaching the server. **Schema drift** is logged.
-
-The proxy is client-agnostic — any MCP client that speaks stdio JSON-RPC works without modification. The manifest format is portable, so a client that implements native manifest checks can skip the proxy and use the same file.
 
 ```bash
 # Scan and save a manifest
@@ -104,5 +106,31 @@ mcp-trustcard scan @modelcontextprotocol/server-filesystem --save-manifest fs.js
 # Run the proxy (point your MCP client at this instead of the server)
 mcp-proxy --manifest fs.json -- npx -y @modelcontextprotocol/server-filesystem /path
 ```
+
+### HTTP proxy (`mcp-http-proxy`)
+
+For remote MCP servers that use HTTP/SSE (Notion, Linear, Atlassian, Figma, Roboflow, DeepWiki):
+
+```bash
+# Generate a manifest for an HTTP server
+node scripts/generate_http_manifests.js  # reads OAuth tokens from Devin auth store
+
+# Run the HTTP proxy
+mcp-http-proxy --manifest notion.json --upstream https://mcp.notion.com/mcp --port 9876 --strict
+```
+
+The HTTP proxy handles both JSON and SSE streaming responses, with the same enforcement as the stdio proxy: unapproved tools stripped, calls blocked, schema drift logged. All log output is redacted to prevent secret leakage.
+
+### Config file secret scanning
+
+Before deploying an MCP config, scan it for exposed secrets:
+
+```bash
+mcp-trustcard scan-config ~/.config/devin/config.json
+```
+
+Detects GitHub tokens, OpenAI keys, Slack tokens, AWS keys, Google keys, Bearer tokens, JWTs, and generic key-value patterns. Use `${env:VAR}` references instead of hardcoded values.
+
+The proxy is client-agnostic — any MCP client that speaks stdio or HTTP JSON-RPC works without modification. The manifest format is portable, so a client that implements native manifest checks can skip the proxy and use the same file.
 
 This is the missing piece between "scan approved this server" and "the server still matches what was approved."

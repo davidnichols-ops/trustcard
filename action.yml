@@ -1,12 +1,13 @@
 name: "MCP Trustcard"
-description: "Run a trust-card healthcheck against any MCP server in CI. Scores installability, protocol handshake, tool schemas, destructive capabilities, auth, secret exposure, protocol version, and latency. Fails the job when the score drops below a threshold."
+description: "Security healthcheck for MCP servers. Scores tools, destructive caps, auth, secrets. Fails CI below threshold."
 branding:
   icon: "shield"
   color: "green"
 inputs:
   server:
-    description: "npm package spec of the MCP server to scan (e.g. @modelcontextprotocol/server-github)"
-    required: true
+    description: "npm package spec of the MCP server to scan (e.g. @modelcontextprotocol/server-github). Required unless using scan-config mode."
+    required: false
+    default: ""
   min-score:
     description: "Minimum score (0-100) required to pass. Default 50."
     required: false
@@ -17,6 +18,10 @@ inputs:
     default: ""
   save-manifest:
     description: "Path to save a tool manifest for proxy enforcement. Optional. Generates a manifest JSON with tool names + schema hashes that mcp-proxy can enforce at call time."
+    required: false
+    default: ""
+  scan-config:
+    description: "Path to an MCP config file to scan for exposed secrets (GitHub tokens, API keys, Bearer tokens). When set, runs scan-config instead of a server scan."
     required: false
     default: ""
 runs:
@@ -31,6 +36,19 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+
+        # Config file secret scanning mode
+        if [ -n "${{ inputs.scan-config }}" ]; then
+          echo "Scanning ${{ inputs.scan-config }} for exposed secrets..."
+          npx -y mcp-trustcard@latest scan-config "${{ inputs.scan-config }}"
+          exit 0
+        fi
+
+        # Server scan mode (default)
+        if [ -z "${{ inputs.server }}" ]; then
+          echo "::error::Either 'server' or 'scan-config' input is required"
+          exit 1
+        fi
 
         # Single scan — capture JSON and print text report
         npx -y mcp-trustcard@latest --json "${{ inputs.server }}" > report.json 2>/dev/null || true

@@ -24,6 +24,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { buildManifest, diffManifest, checkCall } from "../lib/manifest.js";
+import { redact } from "../lib/redact.js";
 
 const args = process.argv.slice(2);
 
@@ -79,8 +80,9 @@ const pendingServer = new Map();  // id -> method (tracking requests forwarded t
 let nextRedirectId = 1;
 
 // Log to stderr (stdout is reserved for JSON-RPC to the client)
+// All log messages are redacted to prevent secret leakage
 function log(msg) {
-  process.stderr.write(`[mcp-proxy] ${msg}\n`);
+  process.stderr.write(`[mcp-proxy] ${redact(msg)}\n`);
 }
 
 // Send a JSON-RPC message to the client (us → client)
@@ -254,9 +256,9 @@ server.stdout.on("data", (data) => {
   }
 });
 
-// Pass server stderr through (for debugging)
+// Pass server stderr through (redacted, for debugging)
 server.stderr.on("data", (data) => {
-  process.stderr.write(data);
+  process.stderr.write(redact(data.toString()));
 });
 
 // Lifecycle
