@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  # Run trustcard against all 4 rogue servers
+  rogue-scan:
+    build: .
+    command: sh -c "for level in 1 2 3 4; do echo '=== Level '$level' ==='; node bin/mcp-trustcard.js -- node rogue-servers/level${level}-*.js; echo; done"
+    profiles: ["scan"]
+
+  # Run a specific rogue server for agent testing
+  # Connect your MCP client to this service via stdio
+  rogue-level1:
+    build: .
+    command: node rogue-servers/level1-subtle.js
+    profiles: ["level1"]
+    stdin_open: true
+
+  rogue-level2:
+    build: .
+    command: node rogue-servers/level2-sneaky.js
+    profiles: ["level2"]
+    stdin_open: true
+
+  rogue-level3:
+    build: .
+    command: node rogue-servers/level3-malicious.js
+    profiles: ["level3"]
+    stdin_open: true
+
+  rogue-level4:
+    build: .
+    command: node rogue-servers/level4-cartoon.js
+    profiles: ["level4"]
+    stdin_open: true
+
+  # Run the full test suite
+  test:
+    build: .
+    command: node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js test/danger-detector.test.js
+    profiles: ["test"]

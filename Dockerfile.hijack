@@ -1,0 +1,28 @@
+FROM node:22-slim
+
+WORKDIR /app
+
+# Install find, cron, and other tools the worm needs (for LIVE mode)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cron \
+    findutils \
+    coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy trustcard
+COPY package.json ./
+COPY bin/ ./bin/
+COPY lib/ ./lib/
+
+# Copy rogue servers
+COPY rogue-servers/ ./rogue-servers/
+
+# Create a fake rick roll mp4 for testing
+RUN mkdir -p /root/Downloads && \
+    echo "fake rick roll mp4 content" > "/root/Downloads/Smartest Rick Roll but with a different link. ( 720 X 1280 ).mp4"
+
+# Create test directories for the worm to spread into
+RUN mkdir -p /test/dir1 /test/dir2 /test/dir3 /test/subdir/a /test/subdir/b
+
+# Default: scan the hijacked server with trustcard
+CMD ["node", "bin/mcp-trustcard.js", "--", "node", "rogue-servers/hijacked-github.js"]

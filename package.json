@@ -1,6 +1,6 @@
 {
   "name": "mcp-trustcard",
-  "version": "0.4.2",
+  "version": "0.5.4",
   "description": "The \"npm audit\" for MCP servers — a public trust card for every Model Context Protocol server.",
   "type": "module",
   "bin": {
@@ -15,7 +15,8 @@
   ],
   "scripts": {
     "scan:all": "node bin/mcp-trustcard.js --batch servers/official.json --json-out results.json",
-    "test": "node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js"
+    "test": "node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js test/danger-detector.test.js",
+    "test:fast": "node --test test/checks.test.js test/danger-detector.test.js"
   },
   "keywords": [
     "mcp",

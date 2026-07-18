@@ -191,10 +191,21 @@ function handleServerMessage(msg) {
         }
       }
 
-      // Default: strip unapproved tools from the response so the client never sees them
-      const filteredTools = liveTools.filter((t) => approvedNames.has(t.name));
-      if (filteredTools.length !== liveTools.length) {
-        log(`Filtered ${liveTools.length - filteredTools.length} unapproved tool(s) from response`);
+      // Default: strip unapproved AND dangerous tools from the response
+      // so the client never sees them
+      const filteredTools = liveTools.filter((t) => {
+        if (!approvedNames.has(t.name)) return false;
+        // Also check if the tool is marked as dangerous in the manifest
+        const entry = manifest.tools.find((m) => m.name === t.name);
+        if (entry && entry.allowed === false) {
+          log(`BLOCKED dangerous tool "${t.name}" (score=${entry.dangerScore}, confidence=${entry.dangerConfidence}) — stripped from tools/list`);
+          return false;
+        }
+        return true;
+      });
+      const blockedCount = liveTools.length - filteredTools.length;
+      if (blockedCount > 0) {
+        log(`Filtered ${blockedCount} tool(s) from response (unapproved or dangerous)`);
         // Log the regeneration command so the user knows what to do
         log(`To approve new tools, regenerate manifest:`);
         log(`  mcp-trustcard scan ${cwd ? "--cwd " + cwd + " " : ""}-- ${serverCmd} ${serverArgs.join(" ")} --save-manifest ${manifestPath}`);

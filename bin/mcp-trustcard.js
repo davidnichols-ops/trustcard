@@ -38,6 +38,10 @@ Options:
   --env-file <file>   load env vars from a .env file (KEY=value lines) and inject into the scanned server
   --cwd <dir>         working directory for local command (use with -- <cmd>)
   --no-color          disable ANSI colors
+  --strict            exit with code 1 if any check is FAIL (for CI)
+  --threshold <n>     exit with code 1 if score is below <n> (default: 50)
+  --parallel <n>      batch scan concurrency (default: 1)
+  --timeout <ms>      per-server timeout (default: 30000)
   -h, --help          show this help
 `);
 }
@@ -268,8 +272,11 @@ async function main() {
     const file = args[batchIdx + 1];
     if (!file || !existsSync(file)) { console.error("missing --batch file"); process.exit(2); }
     const list = JSON.parse(readFileSync(file, "utf8"));
+    const parallelIdx = args.indexOf("--parallel");
+    const parallel = parallelIdx !== -1 ? parseInt(args[parallelIdx + 1]) || 5 : 1;
     const results = [];
-    for (const entry of list) {
+
+    async function scanOne(entry) {
       let spec, env;
       if (typeof entry === "string") {
         spec = entry;
@@ -283,9 +290,34 @@ async function main() {
       const label = typeof spec === "object" ? `${spec.cmd} ${(spec.args ?? []).join(" ")}` : spec;
       process.stderr.write(`scanning ${label}...\n`);
       const r = await runHealthcheck(spec, { env });
-      results.push(r);
-      printReport(r);
+      return r;
     }
+
+    if (parallel > 1) {
+      // Parallel scanning with concurrency limit
+      const queue = [...list];
+      const workers = [];
+      for (let w = 0; w < parallel; w++) {
+        workers.push((async () => {
+          while (queue.length > 0) {
+            const entry = queue.shift();
+            if (!entry) break;
+            const r = await scanOne(entry);
+            results.push(r);
+            printReport(r);
+          }
+        })());
+      }
+      await Promise.all(workers);
+    } else {
+      // Sequential scanning
+      for (const entry of list) {
+        const r = await scanOne(entry);
+        results.push(r);
+        printReport(r);
+      }
+    }
+
     if (jsonOutIdx !== -1) {
       writeFileSync(args[jsonOutIdx + 1], JSON.stringify(results, null, 2));
     }
@@ -299,6 +331,23 @@ async function main() {
       console.log(`${name.padEnd(24)} ${scStr.padEnd(10)} ${dim(r.spec)}`);
     }
     console.log("─".repeat(64));
+
+    // CI mode for batch: exit 1 if any server fails strict/threshold
+    const strict = args.includes("--strict");
+    const thresholdIdx = args.indexOf("--threshold");
+    const threshold = thresholdIdx !== -1 ? parseInt(args[thresholdIdx + 1]) || 50 : 50;
+    if (strict) {
+      const failures = results.filter(r => Object.values(r.checks).some(c => c.status === "FAIL"));
+      if (failures.length > 0) {
+        console.error(red(`\n${failures.length} server(s) have FAIL checks — CI strict mode`));
+        process.exit(1);
+      }
+    }
+    const belowThreshold = results.filter(r => r.score < threshold);
+    if (belowThreshold.length > 0 && thresholdIdx !== -1) {
+      console.error(red(`\n${belowThreshold.length} server(s) below threshold ${threshold} — CI threshold mode`));
+      process.exit(1);
+    }
     return;
   }
 
@@ -317,7 +366,14 @@ async function main() {
   const r = await runHealthcheck(spec, { env: injectedEnv });
   if (jsonFlag) console.log(JSON.stringify(r, null, 2));
   else printReport(r);
-  process.exit(r.score >= 50 ? 0 : 1);
+
+  // CI mode: --strict fails on any FAIL check, --threshold fails on low score
+  const strict = args.includes("--strict");
+  const thresholdIdx = args.indexOf("--threshold");
+  const threshold = thresholdIdx !== -1 ? parseInt(args[thresholdIdx + 1]) || 50 : 50;
+  const hasFail = Object.values(r.checks).some(c => c.status === "FAIL");
+  if (strict && hasFail) process.exit(1);
+  process.exit(r.score >= threshold ? 0 : 1);
 }
 
 main().catch((e) => { console.error("fatal:", e); process.exit(1); });

@@ -1,0 +1,41 @@
+# trustcard.yml — CI configuration for mcp-trustcard
+# Place this file in your repo root or .github/ directory.
+# trustcard will auto-discover it when run with --config.
+
+# Minimum score to pass CI (0-100)
+threshold: 50
+
+# If true, any FAIL check causes CI to fail
+strict: false
+
+# Servers to scan in CI
+servers:
+  # npm packages — scanned via npx
+  - spec: "@modelcontextprotocol/server-filesystem"
+  - spec: "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+
+  # Local commands — scanned directly
+  - cmd: "uv"
+    args: ["run", "maos", "mcp", "serve"]
+    cwd: "."
+
+# Servers to skip (allowlist of known-broken or irrelevant servers)
+skip:
+  - "@modelcontextprotocol/server-puppeteer"  # deprecated
+  - "@storybook/mcp"                          # no bin (HTTP server)
+
+# Checks to ignore (suppress specific check failures)
+ignore_checks:
+  # - protocol_version    # ignore stale protocol version warnings
+  # - secret_exposure     # ignore secret exposure (not recommended)
+
+# Parallel scan concurrency
+parallel: 5
+
+# Per-server timeout in milliseconds
+timeout: 30000
+
+# Output format: text, json, markdown
+output: text

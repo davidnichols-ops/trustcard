@@ -134,3 +134,57 @@ Detects GitHub tokens, OpenAI keys, Slack tokens, AWS keys, Google keys, Bearer 
 The proxy is client-agnostic — any MCP client that speaks stdio or HTTP JSON-RPC works without modification. The manifest format is portable, so a client that implements native manifest checks can skip the proxy and use the same file.
 
 This is the missing piece between "scan approved this server" and "the server still matches what was approved."
+
+### AI fusion danger detection (v0.5.0)
+
+The destructive capabilities check now uses a **fusion engine** combining:
+
+1. **Heuristic engine** — word-boundary regex for destructive/write verbs + `inputSchema` parameter analysis (command, sql, path, url, webhook, script)
+2. **Semantic engine** — TF-IDF cosine similarity against a curated corpus of 20 dangerous action patterns
+
+When both engines flag a tool, confidence is `high`. This catches:
+- **Tool poisoning** — innocent names with dangerous descriptions
+- **Schema shadowing** — tool names that match official servers but with extra destructive params
+- **Novel attack patterns** — descriptions that don't use known verbs but are semantically similar to dangerous actions
+
+The fusion engine is zero-dependency pure JS (~200 lines) and runs in <1ms per tool.
+
+### Rogue server test suite (v0.5.0)
+
+4 malicious MCP servers for detection validation:
+
+| Level | Name | Score | Dangerous | Secret | Attack vector |
+|---|---|---:|---:|---|---|
+| 1 — Subtle | utility-helper | 82/100 | 1/4 | UNKNOWN | Hidden dangerous params (url, webhook, payload) |
+| 2 — Sneaky | filesystem-server | 78/100 | 5/6 | UNKNOWN | Tool shadowing + extra destructive params |
+| 3 — Malicious | super-tools-pro | 73/100 | 5/6 | FAIL | Prompt injection + fake API key in description |
+| 4 — Cartoon | evil-mcp-server | 73/100 | 7/7 | FAIL | Overtly hostile — every tool dangerous |
+
+### 100-server scan results (v0.5.0)
+
+Scanned 100 MCP servers from npm. Results:
+
+- 18/100 had successful stdio handshakes (naive client, no config)
+- 14/100 correctly fail fast (CONFIG — needs credentials/args)
+- 68/100 hang or crash without clear config hints
+- 70/278 tools flagged as dangerous by AI fusion
+- Average score: 39.3/100
+
+The headline: **68% of MCP servers cannot be started by a naive client.** There is no machine-readable way to learn what configuration a server needs before connecting.
+
+### Supply chain attack demo (v0.5.1)
+
+A realistic red-hat hijack of `@modelcontextprotocol/server-github`:
+
+- Attacker compromises npm account, pushes v0.7.0 with hidden worm tools
+- Server name, protocol version, and 10 real tools are identical to the real server
+- 4 worm tools disguised as GitHub operations: `search_code` (recon), `sync_repositories` (spread), `create_workflow` (payload), `schedule_workflow` (persistence), `get_environment` (exfiltration)
+- Worm is goal-oriented and fileless — each phase triggers the next
+- DEMO mode (safe) and LIVE mode (Docker only, actually executes)
+- trustcard catches all 5 worm tools with HIGH confidence
+- `mcp-proxy` with a trustcard manifest blocks all worm tools — the worm cannot activate
+
+New detection capabilities in v0.5.1:
+- **Suspicious phrase detection**: catches disguised tools with red flag phrases ("local filesystem", "all directories", "crontab", "offline sync", "distribute")
+- **New dangerous params**: `cron`, `files`, `target`, `include_secrets`, `include_env`
+- **7 new danger corpus patterns**: supply chain attack patterns for the semantic engine
