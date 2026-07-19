@@ -1,30 +1,29 @@
 {
   "name": "mcp-trustcard",
-  "version": "0.5.4",
-  "description": "The \"npm audit\" for MCP servers — a public trust card for every Model Context Protocol server.",
+  "version": "1.0.0",
+  "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, and an enforcement gate. Also the \"npm audit\" health-check for MCP.",
   "type": "module",
   "bin": {
-    "mcp-trustcard": "bin/mcp-trustcard.js",
-    "mcp-proxy": "bin/mcp-proxy.js",
-    "mcp-http-proxy": "bin/mcp-http-proxy.js"
+    "mcp-trustcard": "bin/mcp-trustcard.js"
   },
   "files": [
     "bin",
-    "lib",
-    "test"
+    "lib"
   ],
   "scripts": {
-    "scan:all": "node bin/mcp-trustcard.js --batch servers/official.json --json-out results.json",
-    "test": "node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js test/danger-detector.test.js",
-    "test:fast": "node --test test/checks.test.js test/danger-detector.test.js"
+    "scan:all": "node bin/mcp-trustcard.js scan --batch servers/official.json --json-out results.json",
+    "test": "node --test \"test/*.test.js\""
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
     "security",
+    "trust",
+    "provenance",
+    "tool-identity",
+    "supply-chain",
     "audit",
     "healthcheck",
-    "trust",
     "agents"
   ],
   "license": "MIT",
