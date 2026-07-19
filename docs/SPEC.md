@@ -276,3 +276,226 @@ Two calls are *reproducible* iff `toolsetDigest` and `argumentsDigest` match;
 comparing `resultDigest` then measures whether the server is deterministic
 under an identical contract — the only meaningful notion of reproducibility
 when tools are mutable. See `lib/receipts.js`.
+
+---
+
+## 10. Capability Descriptors (v2)
+
+This section specifies the protocol-neutral descriptor layer implemented in
+`lib/descriptor.js` and `lib/change.js`. It is additive: everything in §1–§9 is
+unchanged. For rationale and honest non-goals see `docs/DESCRIPTOR.md`.
+
+### 10.1 Definitions
+
+- **Interface identity** `I_id = SHA-256(JCS(semantic projection))`. Byte-equal
+  to `toolDigest` (§3). The capability's identity IS its interface digest;
+  there is no separate `C_id`, and `namespace` is a signed naming claim, never
+  part of the identity hash.
+- **Implementation identity** — a typed object:
+  `{kind:"npm-dist", integrity, algorithm}` | `{kind:"source", digest}` |
+  `{kind:"unresolved"}`. A package name+version is NOT an implementation
+  identity. `unresolved` is an explicit value, never an omission. `npm-dist`
+  proves the published tarball, not the executing process.
+- **Publisher provenance** — `{publisher, keyId, publicKey}`; `keyId =
+  SHA-256(spki(publicKey))`, as in §5.2.
+
+### 10.2 Descriptor format
+
+Schema `trustcard.dev/descriptor@1`:
+
+```jsonc
+{ "schema": "trustcard.dev/descriptor@1",
+  "capability":  { "namespace": "...", "interfaceDigest": "sha256:...", "interface": {...} },
+  "implementation": { "kind": "...", "...": "..." },
+  "provenance":  { "publisher": "...", "keyId": "...", "publicKey": "..." },
+  "issuedAt": "...", "expiresAt": null,
+  "claims": { "...": "..." },              // optional, advisory only
+  "descriptorDigest": "sha256:...",
+  "signature": { "algorithm": "ed25519", "keyId": "...", "value": "..." } }
+```
+
+### 10.3 Signing payload and verification
+
+The signed bytes are the descriptor with `signature` and `descriptorDigest`
+removed, canonicalized with JCS — identical coverage to §5.1.
+`descriptorDigest = SHA-256(JCS(signing payload))` is the content address.
+Verification (`verifyDescriptor`) MUST check, in order: schema; presence of
+`capability.interfaceDigest`, `capability.interface`, `provenance.publicKey`,
+`signature.value`; `keyId` consistency; that `interfaceDigest` equals
+`SHA-256(JCS(embedded interface))`; `descriptorDigest` self-consistency; the
+Ed25519 signature; and `expiresAt`. A descriptor MUST NOT contain local trust
+state (`trust`, `policy`); verifiers reject unknown trust-bearing fields only
+by convention — the normative rule is that none are defined.
+
+### 10.4 Server manifest as a bundle
+
+A v1 server manifest (§5) is interoperable with a set of descriptors:
+`manifestToDescriptors` derives one descriptor per tool;
+`descriptorSetDigest(bundle)` over the embedded interfaces equals
+`toolsetDigest` (§3.2) over the same interfaces. A server provides
+capabilities; it is not itself a capability.
+
+### 10.5 Change vector
+
+`changeVector(prior, current)` classifies a transition across four axes, each
+ordered by consequence:
+
+```
+interface:      NONE < SYNTACTIC < NON_BREAKING < ANNOTATION_DOWNGRADE < BREAKING
+permission:     NONE < REDUCTION < EXPANSION
+implementation: NONE < UNRESOLVED < REPLACED
+provenance:     NONE < KEY_ROTATION < PUBLISHER_CHANGE
+```
+
+The interface axis reuses §4 verbatim, except that a change consisting ONLY of
+permission-relevant annotations is reported on the permission axis (interface
+`NONE`) so it is not double-counted. `I_id` unchanged with a changed
+implementation yields `{interface:"NONE", implementation:"REPLACED"}`.
+`isVectorCompatible(vector)` is the auto-accept decision: true iff interface ≤
+NON_BREAKING, permission ∈ {NONE, REDUCTION}, implementation = NONE, provenance
+= NONE. Callers that only need the §4 answer keep using `isCompatible(diff)`.
+
+### 10.6 Descriptor pins
+
+`PinStore` gains a descriptor-keyed pin space alongside server pins
+(`pinDescriptor` / `getDescriptorPin`), keyed by `descriptorDigest`. The two
+spaces coexist; server pins (§6) are unaffected.
+
+---
+
+## 11. Gate 2 — Invocation Authorization (v2)
+
+§6 (trust state) is **Gate 1**: *is this still the capability I established?*
+It is objective and cacheable. Gate 1 can never answer the second question —
+*given that, may THIS invocation, with THESE arguments, in THIS environment,
+run?* That is **Gate 2** (`lib/policy.js`, wired into `Guard.authorizeCall`).
+The two are strictly ordered: an invocation is evaluated by Gate 2 only after
+Gate 1 has established continuity.
+
+### 11.1 The decision is per-relying-party, not global
+
+Gate 2 is deliberately **not** a general policy language. A shared language
+would force global agreement on what an invocation "means" and destroy the
+per-relying-party trust model (§ TRUST-SUBSTRATE §10.3). Instead there is a
+small set of composable rule predicates; first match wins; default allow:
+
+```
+denyTools([...])                          → deny named tools
+requireApprovalForDestructive()           → destructiveHint → require-approval
+restrictToolToEnvironments(tool, [envs])  → deny tool outside listed envs
+constrainArg(tool, arg, predicate)        → deny when arg present && !predicate(arg)
+forbidArg(tool, arg)                      → deny when arg present at all
+```
+
+The canonical use is the **confused-deputy bound**: a tool can be fully trusted
+(Gate 1) while a specific invocation is out of scope —
+`constrainArg("fetch", "id", id => /^doc-\d+$/.test(id))` denies
+`fetch_document("../../etc/passwd")` even though `fetch_document` is PINNED.
+
+### 11.2 Verdicts
+
+`"allow" | "deny" | "require-approval"`. In `enforce` mode `deny` throws
+`GuardDenial`; `require-approval` throws the distinct `GuardApprovalRequired`
+so the caller can route it to a human rather than treating it as a hard denial.
+A throwing rule predicate is treated as non-matching — it never widens access.
+
+### 11.3 Scoped decision store
+
+`ScopedDecisions` caches Gate-2 decisions keyed `(relyingParty, capability,
+environment)` with a `*` environment fallback. It stores **decisions, not
+capabilities** — "trusted for read in dev, denied in prod" — and is invalidated
+by the caller when the underlying descriptor or scope changes (continuity
+remains Gate 1's job). A decision recorded for one relying party never leaks to
+another.
+
+---
+
+## 12. Signed, Chained Receipts (v2)
+
+A §9 receipt is an unsigned local log line — useful for debugging, worthless as
+evidence. `SignedReceiptChain` (`lib/receipts.js`) upgrades it. The v1 fields
+are preserved byte-for-byte; signing adds:
+
+```jsonc
+{ /* ...all v1 receipt fields... */
+  "relyingParty": "...", "seq": 7, "nonce": "<16 random bytes b64url>",
+  "parentReceipt": "sha256:<digest of previous receipt, null for first>",
+  "receiptDigest": "sha256:...",   // = SHA-256(JCS(payload)); the content address
+  "signature": { "algorithm": "ed25519", "keyId": "...", "value": "..." } }
+```
+
+- **Non-repudiation** — signed by the relying party's Ed25519 key; verify with
+  `verifyReceiptSignature(receipt, publicKey)`.
+- **Tamper-evidence** — `receiptDigest` is the hash of the payload, so any edit
+  breaks self-consistency (`verifyReceipt`) and the signature.
+- **Replay resistance** — `nonce` + `at` timestamp; `seq` is monotonic.
+- **Chain integrity** — each receipt embeds `parentReceipt`; a deleted or
+  reordered receipt breaks the chain (`verifyReceiptChain` reports gaps/breaks).
+
+Signing coverage excludes `signature` and `receiptDigest` (the digest is the
+hash of the payload — same rule as manifests and descriptors). A guard emits
+signed receipts only when configured with `receiptKey`; without one it emits
+the v1 unsigned receipt unchanged.
+
+### 12.1 What a signed receipt proves — and does not
+
+The receipt is signed by the **relying party** (the client that made the call),
+not by the server. This is a deliberate and load-bearing distinction:
+
+- **Proves** — the relying party *recorded this authorization decision* at this
+  sequence position, over this exact (capabilityDigest, argumentsDigest,
+  resultDigest), and has not repudiated it. `verifyReceiptChain` additionally
+  proves the presented history is unbroken, un-reordered, and un-forged (each
+  `receiptDigest` is recomputed, not trusted).
+- **Does NOT prove** — that the call *executed*, that the server *ran* anything,
+  or that the recorded result is *true*. A relying party can sign a receipt for
+  a call that never happened and it will still verify — because the signature
+  attests to the relying party's *record*, not to server behavior. Proving
+  execution would require a *countersigned* receipt (server co-signs) or a
+  transparency log; both are documented non-goals. A signed receipt is
+  **evidence of a decision, not proof of execution.**
+
+`verifyReceipt` is structural only (digest self-consistency + signature
+presence). `verifyReceiptSignature` adds the cryptographic check against a known
+public key. `verifyReceiptChain` adds ordering/integrity across a sequence.
+None of them, alone or together, assert that any tool actually ran.
+
+---
+
+## 13. Publisher Key Rotation & Revocation (v2)
+
+Key compromise is mostly a **UX attack**, not a crypto attack: the crypto
+detects a new key instantly, but "we rotated, please re-pin" is a social claim.
+Old-key-signs-new-key turns it back into a verifiable fact (`lib/rotation.js`).
+
+### 13.1 Rotation certificate
+
+```jsonc
+{ "schema": "trustcard.dev/key-rotation@1", "type": "key-rotation",
+  "oldKeyId": "...", "oldPublicKey": "...",
+  "newKeyId": "...", "newPublicKey": "...",
+  "issuedAt": "...", "expiresAt": null,
+  "digest": "sha256:...",
+  "signature": { "algorithm": "ed25519", "keyId": "<oldKeyId>", "value": "..." } }
+```
+
+Signed by the **old** private key. `verifyRotationCertificate` checks schema,
+embedded-old-keyId consistency, digest self-consistency, expiry (when
+`expiresAt` is set — a lapsed rotation must not keep authorizing a stolen old
+key), and the old key's signature. Without it, every rotation is a fresh TOFU moment; with it, a client
+that pinned the old key can cryptographically confirm the rotation and re-pin
+the new key without trusting a third party. A forged rotation (signed by any
+key other than the old one) fails verification.
+
+### 13.2 Revocation certificate
+
+```jsonc
+{ "schema": "trustcard.dev/revocation@1", "type": "revocation",
+  "keyId": "...", "publicKey": "...", "reason": "...", "issuedAt": "...",
+  "digest": "sha256:...", "signature": { "...", "keyId": "<keyId>" } }
+```
+
+**Self-signed**: only the holder of a key can revoke it, and a revoked key's
+own revocation remains verifiable (you can confirm the key revoked itself).
+`verifyRevocationCertificate` checks the keyId↔publicKey binding, digest, and
+self-signature. A certificate claiming to revoke a key it does not hold fails.

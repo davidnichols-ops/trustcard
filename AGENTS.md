@@ -10,9 +10,15 @@ enforcement guard. The scanner (`scan`) survives as the reference *verifier*.
 Read `docs/ANALYSIS.md` first — it explains *why* the probe abstraction was
 insufficient and what the protocol replaces it with.
 
+> **Session context**: if you are picking up work from the OpenHands sessions
+> that built v2, read `.devin/OPENHANDS-CONTEXT.md` first. It has the
+> session-derived state: what was committed, what is uncommitted in the
+> working tree (a release-hardening audit — do not drop it), which audit
+> tasks remain, and what a continuation agent should do.
+
 ## Commands
 
-- Test: `npm test`  → `node --test "test/*.test.js"` (87 tests, all should pass)
+- Test: `npm test`  → `node --test "test/*.test.js"` (243 tests at v2.0.0, all should pass)
   - IMPORTANT: the glob `"test/*.test.js"` is required. Bare `node --test`
     also matches `test/helpers.js` and the fixture servers, which hang the
     runner (child processes keep stdio open). Don't "simplify" the glob away.
@@ -46,11 +52,30 @@ insufficient and what the protocol replaces it with.
 - `session.js` — live connection: negotiates protocol, verifies handshake
   binding, subscribes to `notifications/tools/list_changed` → re-diff.
 - `guard.js` — the enforcement gate. `wrapClient`/`session.call` route every
-  tools/call through `guard.authorizeCall`. Modes: enforce/audit/off.
+  tools/call through `guard.authorizeCall`. Modes: enforce/audit/off. Gate 1
+  (trust-state continuity) then Gate 2 (invocation policy). Emits signed,
+  chained receipts when given a `receiptKey`.
 - `middleware.js` — `wrapClient(rawClient, {guard, session})` for existing
   frameworks; also re-verifies toolset digest on every `tools/list`.
+- `policy.js` — **Gate 2 (v2).** Per-invocation authorization: composable rule
+  predicates (`denyTools`, `constrainArg`, `forbidArg`,
+  `restrictToolToEnvironments`, `requireApprovalForDestructive`) +
+  `ScopedDecisions` (per-relying-party decision cache). NOT a policy language.
+- `rotation.js` — **(v2).** Old-key-signs-new-key rotation certificates +
+  self-signed revocation certificates (`buildRotationCertificate`,
+  `verifyRotationCertificate`, `buildRevocationCertificate`,
+  `verifyRevocationCertificate`).
 - `observe.js`, `fingerprint.js`, `receipts.js`, `report.js` — probe, full
   card, reproducibility, rendering.
+- `descriptor.js` — **v2 core.** Protocol-neutral capability descriptor.
+  `interfaceDigest()` (byte-equal to `toolDigest`), typed `implementationIdentity`
+  (`npm-dist`/`source`/`unresolved`), `buildDescriptor`/`signDescriptor`/
+  `verifyDescriptor`, `descriptorDigest` (content address), and manifest⇄descriptor
+  adapters. Purely additive over v1 — no v1 bytes changed.
+- `change.js` — **v2.** `changeVector()` classifies a transition across 4 axes
+  (interface/permission/implementation/provenance). Represents the case v1
+  can't: `I_id` same + `M_id` changed → `implementation:"REPLACED"`.
+  `isVectorCompatible()` keeps the simple auto-accept boolean.
 
 ## Invariants / gotchas (don't break these)
 
@@ -66,6 +91,25 @@ insufficient and what the protocol replaces it with.
 5. Fixture servers (`test/fixtures/fake-server.js`) exit on stdin `end` — keep
    that or tests leak processes. The `mutable` scenario reads a state file so
    tests can mutate tools mid-session and fire `list_changed`.
+6. **v2 is additive - never break v1 identity bytes.** `interfaceDigest()` must
+   stay byte-equal to `toolDigest()`; every existing pin/receipt depends on it.
+   The descriptor carries NO local trust state (no `trust`/`policy` fields).
+7. **Implementation identity is honest, not aspirational.** A package
+   name+version is `{kind:"unresolved"}`, never a digest. `npm-dist` proves the
+   tarball, not the running process. Don't claim runtime proof in docs.
+8. **Prefer false drift over false equivalence.** No aggressive schema
+   normalization that could map two behaviorally-different contracts to the
+   same identity. This is why there is no enum-sorting/type-collapsing layer.
+9. **Gate 1 ≠ Gate 2.** Gate 1 (trust-state continuity, `trust.js`/`diff.js`)
+   is objective; Gate 2 (invocation authorization, `policy.js`) is per-relying-
+   party. A tool can be trusted while a specific invocation is denied. Don't
+   let Gate 2 leak global verdicts across relying parties.
+10. **Signed receipts are optional.** Without a `receiptKey` the guard emits the
+    v1 unsigned receipt byte-for-byte. `verifyReceipt` is STRUCTURAL only —
+    cryptographic verification needs `verifyReceiptSignature(receipt, pubkey)`.
+11. **Rotation is old-signs-new.** A rotation cert is only trusted if the OLD
+    key signed it; a revocation cert is only valid self-signed. Anything else
+    is a social claim, not a cryptographic fact — fail closed.
 
 ## MCP facts (as of this writing)
 

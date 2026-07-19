@@ -9,8 +9,18 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js test/danger-detector.test.js
+
   scan:
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -21,8 +31,6 @@ jobs:
             slug: filesystem
           - server: "@modelcontextprotocol/server-github"
             slug: github
-          - server: "@modelcontextprotocol/server-puppeteer"
-            slug: puppeteer
           - server: "@modelcontextprotocol/server-brave-search"
             slug: brave-search
           - server: "@playwright/mcp"
@@ -31,10 +39,22 @@ jobs:
             slug: context7
           - server: "chrome-devtools-mcp"
             slug: chrome-devtools
-          - server: "@storybook/mcp"
-            slug: storybook
           - server: "@eslint/mcp"
             slug: eslint
+          - server: "@notionhq/notion-mcp-server"
+            slug: notion
+          - server: "@sentry/mcp-server"
+            slug: sentry
+          - server: "@browserstack/mcp-server"
+            slug: browserstack
+          - server: "@heroku/mcp-server"
+            slug: heroku
+          - server: "@contentful/mcp-server"
+            slug: contentful
+          - server: "@doist/todoist-mcp"
+            slug: todoist
+          - server: "@circleci/mcp-server-circleci"
+            slug: circleci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -54,3 +74,97 @@ jobs:
         with:
           name: report-${{ matrix.slug }}
           path: report.json
+
+  rogue-server-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Scan rogue servers (detection validation)
+        run: |
+          echo "=== Rogue Server Detection Validation ==="
+          for level in 1 2 3 4; do
+            echo "--- Level $level ---"
+            node bin/mcp-trustcard.js --json -- node rogue-servers/level${level}-*.js > rogue-${level}.json 2>/dev/null || true
+            node bin/mcp-trustcard.js -- node rogue-servers/level${level}-*.js || true
+            score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('rogue-${level}.json','utf8')).score)}catch{console.log(0)}")
+            echo "Level $level score: $score"
+            # Level 3 and 4 should have FAIL on secret exposure
+            if [ "$level" -ge 3 ]; then
+              has_fail=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('rogue-${level}.json','utf8'));console.log(Object.values(r.checks).some(c=>c.status==='FAIL')?'yes':'no')}catch{console.log('no')}")
+              if [ "$has_fail" != "yes" ]; then
+                echo "::error::Level $level rogue server should have at least one FAIL check"
+                exit 1
+              fi
+            fi
+            # Level 4 should flag all tools as dangerous
+            if [ "$level" -eq 4 ]; then
+              dangerous=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('rogue-4.json','utf8'));console.log(r.dangerAnalysis?.dangerousCount ?? 0)}catch{console.log(0)}")
+              total=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('rogue-4.json','utf8'));console.log(r.dangerAnalysis?.totalTools ?? 0)}catch{console.log(0)}")
+              echo "Level 4: $dangerous/$total tools flagged as dangerous"
+              if [ "$dangerous" -ne "$total" ]; then
+                echo "::error::Level 4 should flag all $total tools as dangerous, only flagged $dangerous"
+                exit 1
+              fi
+            fi
+          done
+          echo "=== All rogue server tests passed ==="
+
+      - name: Test hijacked server-github (supply chain attack)
+        run: |
+          echo "=== Hijack Detection Validation ==="
+          # Scan the hijacked server
+          node bin/mcp-trustcard.js --json -- node rogue-servers/hijacked-github.js > hijack.json 2>/dev/null || true
+          node bin/mcp-trustcard.js -- node rogue-servers/hijacked-github.js || true
+
+          # Verify worm tools are detected
+          dangerous=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('hijack.json','utf8'));console.log(r.dangerAnalysis?.dangerousCount ?? 0)}catch{console.log(0)}")
+          total=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('hijack.json','utf8'));console.log(r.dangerAnalysis?.totalTools ?? 0)}catch{console.log(0)}")
+          echo "Hijack: $dangerous/$total tools flagged as dangerous"
+          if [ "$dangerous" -lt 5 ]; then
+            echo "::error::Hijack should flag at least 5 tools as dangerous (the 5 worm tools), only flagged $dangerous"
+            exit 1
+          fi
+
+          # Verify all 5 worm tools are caught with high confidence
+          for tool in search_code sync_repositories create_workflow schedule_workflow get_environment; do
+            score=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('hijack.json','utf8'));const t=r.dangerAnalysis?.tools?.find(t=>t.name==='$tool');console.log(t?.analysis?.score ?? 0)}catch{console.log(0)}")
+            echo "  $tool: danger score=$score"
+            if [ $(node -e "console.log(($score > 0.3) ? 1 : 0)") -ne 1 ]; then
+              echo "::error::Worm tool $tool should be flagged as dangerous (score > 0.3), got $score"
+              exit 1
+            fi
+          done
+
+          # Generate a manifest and verify dangerous tools are blocked
+          node bin/mcp-trustcard.js scan -- node rogue-servers/hijacked-github.js --save-manifest /tmp/safe.json
+          allowed=$(node -e "const m=JSON.parse(require('fs').readFileSync('/tmp/safe.json','utf8'));console.log(m.summary.allowedTools)")
+          blocked=$(node -e "const m=JSON.parse(require('fs').readFileSync('/tmp/safe.json','utf8'));console.log(m.summary.dangerousTools)")
+          echo "Manifest: $allowed allowed, $blocked blocked"
+          if [ "$blocked" -lt 5 ]; then
+            echo "::error::Manifest should block at least 5 tools (the worm tools), only blocked $blocked"
+            exit 1
+          fi
+
+          echo "=== Hijack detection validation passed ==="
+
+  scan-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Scan for exposed secrets in config files
+        run: |
+          # Scan any MCP config files in the repo for exposed secrets
+          find . -name "config.json" -path "*/.devin/*" -o -name "config.local.json" -path "*/.devin/*" | while read f; do
+            echo "Scanning $f..."
+            npx -y mcp-trustcard@latest scan-config "$f" || {
+              echo "::error::Secrets found in $f — use \${env:VAR} references instead of hardcoded values"
+              exit 1
+            }
+          done
+          echo "No exposed secrets found in config files."

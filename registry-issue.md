@@ -82,4 +82,14 @@ case, and live TOCTOU/notification scenarios.
 2. Treat `trustcard` as a reference verifier (happy to contribute it).
 3. Optionally surface manifest-verification status on registry pages.
 
-Happy to open a PR against the registry schema if there's interest.
+Full proposal with rationale, drift-detection examples, and the scorecard methodology: https://github.com/davidnichols-ops/trustcard/blob/main/PROPOSAL.md
+
+Happy to open a PR against the registry schema if there's interest. Tagging for discussion.
+
+## Update: call-time enforcement proxy
+
+Since filing this issue, we've added a **stdio proxy** (`mcp-proxy`) that enforces an approved tool manifest at call time. A scan generates a manifest (tool names + SHA-256 schema hashes); the proxy sits between client and server, strips unapproved tools from `tools/list`, and blocks calls to tools not in the manifest. This closes the gap between "scan approved this server" and "the server still matches what was approved" — the exact drift problem several commenters raised.
+
+The proxy is client-agnostic (works with any stdio MCP client, no client-side changes) and the manifest format is portable (clients can implement native checks and skip the proxy). Demoed against real MCP servers (filesystem, git) with Claude Code as the client.
+
+See: https://github.com/davidnichols-ops/trustcard#call-time-enforcement-proxy

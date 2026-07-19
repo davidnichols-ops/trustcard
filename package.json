@@ -1,18 +1,22 @@
 {
   "name": "mcp-trustcard",
-  "version": "1.0.0",
-  "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, and an enforcement gate. Also the \"npm audit\" health-check for MCP.",
+  "version": "2.0.0",
+  "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, capability descriptors, a two-gate invocation policy, signed+chained receipts, and publisher key rotation. Also the \"npm audit\" health-check / public trust card for every Model Context Protocol server.",
   "type": "module",
   "bin": {
-    "mcp-trustcard": "bin/mcp-trustcard.js"
+    "mcp-trustcard": "bin/mcp-trustcard.js",
+    "mcp-proxy": "bin/mcp-proxy.js",
+    "mcp-http-proxy": "bin/mcp-http-proxy.js"
   },
   "files": [
     "bin",
-    "lib"
+    "lib",
+    "test"
   ],
   "scripts": {
     "scan:all": "node bin/mcp-trustcard.js scan --batch servers/official.json --json-out results.json",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "test:fast": "node --test test/checks.test.js test/danger-detector.test.js"
   },
   "keywords": [
     "mcp",

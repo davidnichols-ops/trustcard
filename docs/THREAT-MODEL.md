@@ -47,6 +47,24 @@ pins the tarball bytes) but does not vouch for runtime behavior.
 | 10 | **Shadowing**: two servers registering same-named tools | serverDigest binds serverInfo; per-server pins keep namespaces separate | An agent merging tools across servers without namespacing. Client-side concern. |
 | 11 | **Corrupt pin file** | detected, flagged (`corrupt`), and *nothing is trusted* (fail closed) | Availability: user must re-pin. Correct trade-off. |
 
+## v2 attack scenarios → controls
+
+v2 adds descriptors, a two-gate invocation policy, signed+chained receipts, and
+key rotation/revocation. Each new mechanism introduces its own attack surface;
+these are the classes the adversarial suite (`test/adversarial.test.js`,
+`test/audit-probes.test.js`) executes.
+
+| # | Attack | Control | Residual risk |
+|---|---|---|---|
+| 12 | **Forged descriptor** (attacker signs a descriptor with a different key, or strips the signature) | `verifyDescriptor` requires a valid publisher signature over the exact descriptor payload; a descriptor with no signature or a wrong-key signature never reaches the trusted state | None for detection — a descriptor is *only* trusted when its publisher signature verifies. |
+| 13 | **Descriptor mutation after approval** (agent or process edits the approved descriptor in memory) | capabilityDigest is recomputed at Gate 2 for every call; any field change alters the digest → MISMATCH | None for the digest itself. A caller holding the *old* digest bytes can't forge a new descriptor that hashes to them (SHA-256 preimage). |
+| 14 | **Argument injection** at Gate 2 (path traversal `../../etc/passwd`, schema-valid-but-hostile values) | `InvocationPolicy` re-validates arguments against the *approved* descriptor's schema and an optional per-tool arg policy, independent of Gate 1's "is this the right tool" check | The schema itself is the boundary: a hostile value that *is* schema-valid and not caught by arg policy passes. Annotations/schema are the contract; a too-loose schema is a contract author problem, not a trustcard gap. |
+| 15 | **Cross-agent authorization bleed** (agent A's approval reused by agent B) | Gate 2 decisions are scoped to (agentId, capabilityDigest); a decision recorded for one agentId is not honored for another | A caller that can *read* another agent's decision record and present the same agentId. Scope keys are the boundary; an agent that can impersonate another's id is outside the model (that's an agent-runtime isolation problem). |
+| 16 | **Receipt chain forgery**: tamper with a receipt *body* but keep the chain fields | **Fixed this audit.** `verifyReceiptChain` now *recomputes* `receiptDigest` from each payload and requires it to equal the embedded value (previously it trusted the embedded digest — a tampered body passed). Pinned by a regression test. | A relying party that signs a false receipt from the start (see §12.1 — receipts prove a *decision was recorded*, not that a call executed). |
+| 17 | **Rotation replay** (re-present an old rotation cert indefinitely) | rotation certs carry `expiresAt`; `verifyRotationCertificate` rejects a lapsed cert so a stolen old key can't keep authorizing rotations forever | A rotation cert issued with no `expiresAt` (or a far-future one) is valid until then by design. Publishers SHOULD set a short window. **Revocation deliberately has no expiry** — a revocation must never lapse. |
+| 18 | **Revocation expiry attack** (wait for a revocation to "expire," then reuse the key) | Closed by design: `verifyRevocationCertificate` performs **no** expiry check. A revocation is permanent the moment it verifies. | None — this asymmetry (rotation expires, revocation doesn't) is the control. |
+| 19 | **TOCTOU between descriptor fetch and invocation** | Gate 1 binds the descriptor at session scope; Gate 2 re-asserts the same capabilityDigest at call time; a mutation between gates changes the digest → Gate 2 denies | Same residual as #2 — a server that neither binds nor notifies, mutating in the gap between Gate 2 and the actual transport send. Bounded by receipts. |
+
 ## Explicit non-goals
 
 - **Runtime behavior of a tool.** trustcard pins the *contract* (definition),
