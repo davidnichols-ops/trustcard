@@ -18,7 +18,7 @@ insufficient and what the protocol replaces it with.
 
 ## Commands
 
-- Test: `npm test`  → `node --test "test/*.test.js"` (254 tests, all should pass)
+- Test: `npm test`  → `node --test "test/*.test.js"` (273 tests, all should pass)
   - IMPORTANT: the glob `"test/*.test.js"` is required. Bare `node --test`
     also matches `test/helpers.js` and the fixture servers, which hang the
     runner (child processes keep stdio open). Don't "simplify" the glob away.
@@ -75,6 +75,14 @@ insufficient and what the protocol replaces it with.
   `verifyRevocationCertificate`).
 - `observe.js`, `fingerprint.js`, `receipts.js`, `report.js` — probe, full
   card, reproducibility, rendering.
+- `danger-detector.js` — three-engine fusion: (1) heuristic (destructive verbs
+  + dangerous params + suspicious phrases, context-aware scoring for verbs like
+  "clear"/"reset" that are only destructive with destructive nouns), (2) semantic
+  (TF-IDF cosine similarity against curated dangerous-action corpus), (3) injection
+  (prompt-injection marker detection — `<IMPORTANT>`, `[SYSTEM OVERRIDE]`, "ignore
+  previous instructions", sensitive file paths, secrecy instructions, base64 blobs).
+  Safe tool patterns (create_directory, mkdir, sequentialthinking) override to
+  non-dangerous unless the injection detector flags the description.
 - `descriptor.js` — **v2 core.** Protocol-neutral capability descriptor.
   `interfaceDigest()` (byte-equal to `toolDigest`), typed `implementationIdentity`
   (`npm-dist`/`source`/`unresolved`), `buildDescriptor`/`signDescriptor`/

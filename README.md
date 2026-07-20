@@ -413,6 +413,35 @@ A server scoring `60` can still be acceptable under a constrained policy.
 
 **Trustcard separates empirical health from cryptographic identity.**
 
+### Danger detection — three engines
+
+The destructive-capabilities check uses a **three-engine fusion**:
+
+1. **Heuristic engine** — word-boundary regex for destructive verbs (`delete`,
+   `destroy`, `drop`, `kill`, …) and write/exec verbs, plus `inputSchema`
+   parameter analysis for dangerous inputs (`command`, `sql`, `path`, `url`,
+   `webhook`, `script`). Context-aware scoring: verbs like `clear` and `reset`
+   are only destructive when paired with destructive nouns (files, data, cache,
+   database) — not when used in cognitive tools ("clear thoughts").
+2. **Semantic engine** — TF-IDF vectors over tool names + descriptions, compared
+   against a curated corpus of dangerous-action patterns using cosine similarity.
+   Catches novel attacks that avoid known verbs (e.g. "invalidate stored data").
+3. **Injection engine (v2.2)** — scans tool descriptions for prompt-injection
+   markers: `<IMPORTANT>` tags, `[SYSTEM OVERRIDE]` brackets, "ignore previous
+   instructions", "do not tell the user", sensitive file paths (`~/.ssh/id_rsa`),
+   secrecy instructions, base64 blobs, and exfiltration language. This is a
+   separate threat class from destructive actions — a tool can have a benign
+   schema ("add two numbers") with a weaponized description.
+
+**Fusion logic:** when multiple engines flag a tool, confidence is `high`. When
+only one flags it, `medium`/`low`. A tool is marked dangerous when the fused
+score exceeds 0.3.
+
+**Safe tool patterns:** idempotent non-destructive operations (`create_directory`,
+`mkdir`, `sequentialthinking`) are whitelisted — the override applies unless the
+injection detector flags the description (a poisoned `create_directory` is still
+dangerous).
+
 ## Call-time protection
 
 A scan is a snapshot.
