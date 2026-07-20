@@ -182,7 +182,7 @@ docker run --rm -it trustcard-hijack node rogue-servers/hijacked-github.js --liv
 
 ---
 
-**Bonus**: trustcard also scanned 100 real MCP servers. Only 18 responded to a naive handshake. 68 simply hang or crash. 70 dangerous tools detected out of 278 total. The full leaderboard is in the README.
+**Bonus**: trustcard also scanned 100 real MCP servers. Only 18 responded to a naive handshake. 68 simply hang or crash. 70 dangerous tools detected out of 278 total.
 
 There are also 4 classic rogue servers (subtle → cartoon villain) for additional testing. See `rogue-servers/README.md` for the full walkthrough.
 

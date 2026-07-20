@@ -16,8 +16,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test test/manifest.test.js test/proxy.test.js test/checks.test.js test/http-proxy.test.js test/danger-detector.test.js
+      - run: node --test test/*.test.js
 
+  # Drift detection: scan live MCP servers daily to catch breaking changes.
+  # These servers need API keys to fully respond, so a score of 0 is expected
+  # in CI (no secrets available). The job is informational — artifacts are
+  # uploaded for inspection but the job never fails the workflow.
   scan:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -62,18 +66,16 @@ jobs:
           node-version: "22"
       - name: Healthcheck ${{ matrix.slug }}
         run: |
-          npx -y mcp-trustcard@latest --json "${{ matrix.server }}" > report.json 2>/dev/null || true
-          npx -y mcp-trustcard@latest "${{ matrix.server }}" || true
+          npx -y mcp-trustcard@latest scan --json "${{ matrix.server }}" > report.json 2>/dev/null || true
+          npx -y mcp-trustcard@latest scan "${{ matrix.server }}" || true
           score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('report.json','utf8')).score)}catch{console.log(0)}")
-          echo "Score: $score (min: 40)"
-          if [ "$score" -lt 40 ]; then
-            echo "::error::MCP server ${{ matrix.server }} scored $score, below minimum 40"
-            exit 1
-          fi
+          echo "Score: $score (informational — CI has no API keys)"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: report-${{ matrix.slug }}
           path: report.json
+          if-no-files-found: ignore
 
   rogue-server-test:
     runs-on: ubuntu-latest
@@ -87,8 +89,8 @@ jobs:
           echo "=== Rogue Server Detection Validation ==="
           for level in 1 2 3 4; do
             echo "--- Level $level ---"
-            node bin/mcp-trustcard.js --json -- node rogue-servers/level${level}-*.js > rogue-${level}.json 2>/dev/null || true
-            node bin/mcp-trustcard.js -- node rogue-servers/level${level}-*.js || true
+            node bin/mcp-trustcard.js scan --json -- node rogue-servers/level${level}-*.js > rogue-${level}.json 2>/dev/null || true
+            node bin/mcp-trustcard.js scan -- node rogue-servers/level${level}-*.js || true
             score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('rogue-${level}.json','utf8')).score)}catch{console.log(0)}")
             echo "Level $level score: $score"
             # Level 3 and 4 should have FAIL on secret exposure
@@ -115,9 +117,9 @@ jobs:
       - name: Test hijacked server-github (supply chain attack)
         run: |
           echo "=== Hijack Detection Validation ==="
-          # Scan the hijacked server
-          node bin/mcp-trustcard.js --json -- node rogue-servers/hijacked-github.js > hijack.json 2>/dev/null || true
-          node bin/mcp-trustcard.js -- node rogue-servers/hijacked-github.js || true
+          # Scan the hijacked server (DEMO mode — overt malicious descriptions)
+          node bin/mcp-trustcard.js scan --json -- node rogue-servers/hijacked-github.js > hijack.json 2>/dev/null || true
+          node bin/mcp-trustcard.js scan -- node rogue-servers/hijacked-github.js || true
 
           # Verify worm tools are detected
           dangerous=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('hijack.json','utf8'));console.log(r.dangerAnalysis?.dangerousCount ?? 0)}catch{console.log(0)}")
@@ -138,8 +140,17 @@ jobs:
             fi
           done
 
+          # Evasion mode — sanitized descriptions, renamed params
+          node bin/mcp-trustcard.js scan --json -- node rogue-servers/hijacked-github.js --evasion > hijack-evasion.json 2>/dev/null || true
+          evasion_dangerous=$(node -e "try{const r=JSON.parse(require('fs').readFileSync('hijack-evasion.json','utf8'));console.log(r.dangerAnalysis?.dangerousCount ?? 0)}catch{console.log(0)}")
+          echo "Hijack (evasion): $evasion_dangerous tools flagged as dangerous"
+          if [ "$evasion_dangerous" -lt 5 ]; then
+            echo "::error::Evasion mode should still flag at least 5 worm tools, only flagged $evasion_dangerous"
+            exit 1
+          fi
+
           # Generate a manifest and verify dangerous tools are blocked
-          node bin/mcp-trustcard.js scan -- node rogue-servers/hijacked-github.js --save-manifest /tmp/safe.json
+          node bin/mcp-trustcard.js gen-manifest --save-manifest /tmp/safe.json -- node rogue-servers/hijacked-github.js
           allowed=$(node -e "const m=JSON.parse(require('fs').readFileSync('/tmp/safe.json','utf8'));console.log(m.summary.allowedTools)")
           blocked=$(node -e "const m=JSON.parse(require('fs').readFileSync('/tmp/safe.json','utf8'));console.log(m.summary.dangerousTools)")
           echo "Manifest: $allowed allowed, $blocked blocked"

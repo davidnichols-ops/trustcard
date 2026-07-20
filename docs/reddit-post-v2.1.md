@@ -98,7 +98,7 @@ Full security model: [docs/SECURITY-MODEL.md](https://github.com/davidnichols-op
 
 ### The 100-server scan
 
-trustcard also includes an empirical scanner (the "npm audit" for MCP). I scanned 100 MCP servers as naive clients. **68 of 100 cannot be started by a naive client.** Only 18 responded to a stdio handshake without configuration. The full leaderboard is in the README.
+trustcard also includes an empirical scanner (the "npm audit" for MCP). I scanned 100 MCP servers as naive clients. **68 of 100 cannot be started by a naive client.** Only 18 responded to a stdio handshake without configuration.
 
 ### Quickstart
 
