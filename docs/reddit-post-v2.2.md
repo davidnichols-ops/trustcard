@@ -1,4 +1,4 @@
-# Reddit Post — v2.2.0
+# Reddit Post — v2.2.1
 
 **Subreddits:** r/LocalLLaMA, r/ClaudeAI, r/mcp, r/cybersecurity
 **Timing:** Tuesday or Wednesday morning US time
@@ -13,7 +13,7 @@ I scanned 104 MCP servers, simulated a supply chain attack, and built cryptograp
 
 I installed 104 MCP servers on a fresh VM. 57 actually responded to `tools/list` — 1,218 tools total. Then I ran my tool [trustcard](https://github.com/davidnichols-ops/trustcard) against all of them, simulated a supply chain attack on the most popular MCP server, and tested 5 real-world tool-poisoning PoCs from GitHub.
 
-**[npm: `mcp-trustcard@2.2.0`]** · **[GitHub: davidnichols-ops/trustcard](https://github.com/davidnichols-ops/trustcard)** · **[Security Model](https://github.com/davidnichols-ops/trustcard/blob/master/docs/SECURITY-MODEL.md)**
+**[npm: `mcp-trustcard@2.2.1`]** · **[GitHub: davidnichols-ops/trustcard](https://github.com/davidnichols-ops/trustcard)** · **[Security Model](https://github.com/davidnichols-ops/trustcard/blob/master/docs/SECURITY-MODEL.md)**
 
 ### The problem
 
@@ -127,7 +127,7 @@ mcp-trustcard inspect memory.json
 mcp-proxy --manifest memory.json -- npx -y @modelcontextprotocol/server-memory
 ```
 
-No runtime dependencies. Pure Node.js stdlib. 273 tests. MIT licensed.
+No runtime dependencies. Pure Node.js stdlib. 283 tests. MIT licensed.
 
 ### The challenge
 

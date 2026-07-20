@@ -18,7 +18,7 @@ insufficient and what the protocol replaces it with.
 
 ## Commands
 
-- Test: `npm test`  → `node --test "test/*.test.js"` (273 tests, all should pass)
+- Test: `npm test`  → `node --test "test/*.test.js"` (283 tests, all should pass)
   - IMPORTANT: the glob `"test/*.test.js"` is required. Bare `node --test`
     also matches `test/helpers.js` and the fixture servers, which hang the
     runner (child processes keep stdio open). Don't "simplify" the glob away.

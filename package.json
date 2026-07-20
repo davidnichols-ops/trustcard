@@ -1,6 +1,6 @@
 {
   "name": "mcp-trustcard",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, capability descriptors, a two-gate invocation policy, signed+chained receipts, and publisher key rotation. Also the \"npm audit\" health-check / public trust card for every Model Context Protocol server.",
   "type": "module",
   "bin": {

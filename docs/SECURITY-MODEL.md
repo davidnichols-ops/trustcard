@@ -32,7 +32,7 @@ For the protocol design rationale, see [TRUST-SUBSTRATE.md](TRUST-SUBSTRATE.md).
 | Detect manifest tampering | **Yes** | `verifyManifest` recomputes manifestDigest, toolsetDigest, and serverDigest from the payload and requires all to match. | `lib/provenance.js` |
 | Enforce manifest freshness | **Yes** (signed manifests) | `expiresAt` field in signed manifests; `verifyManifest` rejects expired manifests. | `lib/provenance.js` |
 | Enforce rotation freshness | **Yes** | Rotation certificates carry `expiresAt`; `verifyRotationCertificate` rejects lapsed certs. Revocation has no expiry by design. | `lib/rotation.js` |
-| Detect dangerous tool capabilities | **Partial** | Static analysis: heuristic verb/param matching + TF-IDF semantic similarity. Catches declared destructive capabilities. Cannot detect a tool that *lies* in its description. | `lib/danger-detector.js` |
+| Detect dangerous tool capabilities | **Partial** | Three-engine static analysis: (1) heuristic verb/param matching with context-aware scoring, (2) TF-IDF semantic similarity, (3) prompt-injection marker detection (`<IMPORTANT>`, `[SYSTEM OVERRIDE]`, "ignore previous instructions", sensitive file paths, secrecy instructions). Catches declared destructive capabilities and description weaponization. Cannot detect a tool that *lies* in its description without using known injection patterns. | `lib/danger-detector.js` |
 | Close TOCTOU window (discovery → call) | **Partial** | Fully closed for cooperating servers (handshake binding). For non-cooperating servers, bounded by `list_changed` re-diff + strict arg validation + receipts. Not eliminated. | `lib/session.js` |
 | **Prove tool behavior** | **No** | Out of scope. trustcard pins the *contract* (definition), not what the code does when called. A signed read-only tool can still behave badly. | — |
 | **Prevent malicious publishers** | **No** | Out of scope for cryptography. Signatures prove provenance, not intent. The scanner and social accountability are the mitigation. | — |
@@ -181,9 +181,31 @@ error) and by the pin store (line 33: schema must match `PINFILE_SCHEMA`).
   manifest lookup service. The pin store is local TOFU state, not a
   registry.
 - **Not an AI safety system.** The danger detector is static analysis
-  (regex + TF-IDF), not model inference. It catches *declared* destructive
-  capabilities, not *behavioral* dangers. A tool that lies in its
-  description will not be caught by the danger detector.
+  (regex + TF-IDF + injection markers), not model inference. It catches
+  *declared* destructive capabilities and *known* prompt-injection patterns,
+  not *behavioral* dangers. A tool that lies in its description without
+  using known injection markers will not be caught by the danger detector.
+  The injection detector is pattern-based, not semantic — novel injection
+  techniques that avoid the known markers will pass through.
+
+## Known limitations
+
+- **Naive scan client.** The scan client deliberately stays naive — it does
+  not declare `capabilities.tools.taskSupport: 'required'` or other advanced
+  capabilities. This is by design: it tests what a naive agent experiences.
+  Servers that require augmented capabilities (e.g. the `everything` server's
+  `simulate-research-query`) will error out during scanning. This surfaces the
+  discovery gap, not a bug.
+- **Pattern-based injection detection.** The injection detector matches known
+  patterns (`<IMPORTANT>`, `[SYSTEM OVERRIDE]`, "ignore previous instructions",
+  etc.). Novel injection techniques that avoid these markers will pass through.
+  The detector is not semantic — it does not understand the *intent* of a
+  description, only whether it contains known attack patterns.
+- **Single probe.** Secret exposure is `UNKNOWN` unless a secret surfaces in
+  one scan run. A real audit needs fuzzing and traffic replay.
+- **No runtime sandboxing.** trustcard enforces the *contract*, not the
+  *behavior*. A signed read-only tool can still behave badly. Use OS-level
+  isolation for runtime containment.
 
 ## Deployment model
 
