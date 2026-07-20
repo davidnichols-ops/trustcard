@@ -1,6 +1,6 @@
 {
   "name": "mcp-trustcard",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, capability descriptors, a two-gate invocation policy, signed+chained receipts, and publisher key rotation. Also the \"npm audit\" health-check / public trust card for every Model Context Protocol server.",
   "type": "module",
   "bin": {
@@ -8,10 +8,17 @@
     "mcp-proxy": "bin/mcp-proxy.js",
     "mcp-http-proxy": "bin/mcp-http-proxy.js"
   },
+  "exports": {
+    ".": "./lib/guard.js",
+    "./lib/*": "./lib/*.js"
+  },
   "files": [
     "bin",
     "lib",
-    "test"
+    "docs",
+    "examples",
+    "test",
+    "!docs/reddit-master-plan.md"
   ],
   "scripts": {
     "scan:all": "node bin/mcp-trustcard.js scan --batch servers/official.json --json-out results.json",

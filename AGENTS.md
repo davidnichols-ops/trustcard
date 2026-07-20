@@ -18,12 +18,12 @@ insufficient and what the protocol replaces it with.
 
 ## Commands
 
-- Test: `npm test`  → `node --test "test/*.test.js"` (243 tests at v2.0.0, all should pass)
+- Test: `npm test`  → `node --test "test/*.test.js"` (254 tests, all should pass)
   - IMPORTANT: the glob `"test/*.test.js"` is required. Bare `node --test`
     also matches `test/helpers.js` and the fixture servers, which hang the
     runner (child processes keep stdio open). Don't "simplify" the glob away.
 - CLI: `node bin/mcp-trustcard.js <subcommand>` (keygen/manifest/sign/verify/
-  diff/pin/pins/fingerprint/scan)
+  diff/pin/pins/fingerprint/scan/gen-manifest/inspect)
 - No runtime deps. Pure Node stdlib. Don't add dependencies.
 
 ## Architecture map (lib/)
@@ -46,7 +46,15 @@ insufficient and what the protocol replaces it with.
   unchanged schema = suspected tool poisoning.
 - `trust.js` — state machine UNKNOWN→OBSERVED→PINNED→MISMATCH/SUSPECT→REVOKED.
   REVOKED is terminal per session (sticky); only `approve()` exits it.
+  Also exports `trustLevel(state)` — human-facing projection onto
+  TRUSTED/VERIFIED/OBSERVED/UNTRUSTED/REVOKED (the internal state machine
+  is unchanged; this is a derived view for UIs and APIs).
 - `provenance.js` — manifest build/sign/verify. Ed25519 via node:crypto.
+  Signed manifests carry `expiresAt`; `verifyManifest` rejects expired ones.
+- `manifest.js` — proxy-enforcement manifest (separate from signed manifests).
+  `buildManifest` includes `expiresAt` (default 90 days); `checkCall` blocks
+  all calls when the manifest is expired. `--allow-tool` overrides record
+  `manualOverride: true` so the override is visible in audit.
 - `pin.js` — TOFU pin store (servers + publisher keys), atomic writes,
   fail-closed on corrupt file.
 - `session.js` — live connection: negotiates protocol, verifies handshake

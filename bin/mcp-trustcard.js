@@ -77,7 +77,8 @@ Health scorecard (scanner):
   mcp-trustcard scan --batch servers.json [--json-out results.json] [--parallel n]
   mcp-trustcard scan-config <config.json>      # scan an MCP config for exposed secrets
   mcp-trustcard gen-manifest <spec> --save-manifest <file>   # proxy-enforcement manifest
-  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...]
+  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...] [--expires-in <days>|--no-expiry]
+  mcp-trustcard inspect <file>                 # inspect a manifest or pin store
   mcp-trustcard <spec>                         # shorthand for scan
 
 Options: --json  --no-color  --pins <path>  --env-file <f>  --cwd <dir>
@@ -300,6 +301,12 @@ async function cmdGenManifest() {
     }
   }
 
+  // Expiry override: --expires-in <days> (default 90). --no-expiry disables.
+  const expiresFlag = opt("--expires-in");
+  const expiresInDays = expiresFlag === "none" || argv.includes("--no-expiry")
+    ? null
+    : expiresFlag ? parseInt(expiresFlag, 10) : 90;
+
   const local = parseLocalCommand(argv.slice(1));
   let cmd, args, specStr, scwd;
   if (local) {
@@ -337,12 +344,13 @@ async function cmdGenManifest() {
     client.notify("notifications/initialized", {});
     const res = await client.request("tools/list", {}, 10_000);
     const tools = Array.isArray(res?.tools) ? res.tools : [];
-    const manifest = buildProxyManifest(tools, init?.serverInfo ?? null, specStr, allowTools);
+    const manifest = buildProxyManifest(tools, init?.serverInfo ?? null, specStr, allowTools, expiresInDays);
     writeFileSync(outFile, JSON.stringify(manifest, null, 2));
     console.log(`Manifest saved: ${outFile}`);
     console.log(`  Server: ${manifest.serverInfo?.name ?? specStr}`);
     console.log(`  Tools:  ${manifest.tools.length}`);
     console.log(`  Hash:   ${manifest.manifestHash}`);
+    console.log(`  Expires: ${manifest.expiresAt ?? "never"}`);
     if (allowTools.length > 0) {
       console.log(`  Overrides: ${allowTools.join(", ")}`);
     }
@@ -502,6 +510,106 @@ async function cmdPins() {
   console.log("");
 }
 
+// inspect: human-readable summary of a manifest or pin store.
+// Works on both proxy manifests (lib/manifest.js) and signed manifests
+// (lib/provenance.js). Detects which format by looking for `signature`.
+async function cmdInspect() {
+  const file = positional(1)[0];
+  if (!file) { console.error("inspect: missing <file>"); process.exit(2); }
+
+  let data;
+  try {
+    data = JSON.parse(readFileSync(file, "utf8"));
+  } catch (e) {
+    console.error(`inspect: cannot read ${file}: ${e.message}`);
+    process.exit(1);
+  }
+
+  const isSigned = !!data.signature;
+  const isProxy = data.version === 1 && Array.isArray(data.tools) && !data.signature;
+  const isPinStore = data.schema === "trustcard.dev/pins@1";
+
+  if (isSigned) return inspectSignedManifest(data, file);
+  if (isProxy) return inspectProxyManifest(data, file);
+  if (isPinStore) return inspectPinStore(data, file);
+
+  console.error(`inspect: unrecognized file format (no signature, no version=1 tools, no pins schema)`);
+  process.exit(1);
+}
+
+function inspectProxyManifest(m, file) {
+  console.log(`Trustcard Proxy Manifest: ${file}`);
+  console.log("─".repeat(60));
+  console.log(`  Server:     ${m.serverInfo?.name ?? "?"} ${m.serverInfo?.version ?? ""}`);
+  console.log(`  Spec:       ${m.spec ?? "?"}`);
+  console.log(`  Hash:       ${m.manifestHash}`);
+  console.log(`  Created:    ${m.createdAt}`);
+  console.log(`  Expires:    ${m.expiresAt ?? "never"}${m.expiresAt && Date.parse(m.expiresAt) < Date.now() ? " (EXPIRED)" : ""}`);
+  console.log(`  Tools:      ${m.summary.totalTools} total, ${m.summary.allowedTools} allowed, ${m.summary.dangerousTools} dangerous${m.summary.overriddenTools ? `, ${m.summary.overriddenTools} overridden` : ""}`);
+  console.log("");
+  console.log("  Tools:");
+  for (const t of m.tools) {
+    const status = t.manualOverride ? "[override]" : t.allowed ? "[allowed]" : "[blocked]";
+    const danger = t.dangerScore > 0 ? ` danger=${t.dangerScore}(${t.dangerConfidence})` : "";
+    console.log(`    ${t.name.padEnd(36)} ${status}${danger}`);
+  }
+}
+
+function inspectSignedManifest(m, file) {
+  const v = verifyManifest(m);
+  console.log(`Trustcard Signed Manifest: ${file}`);
+  console.log("─".repeat(60));
+  console.log(`  Schema:     ${m.schema}`);
+  console.log(`  Server:     ${m.server?.name ?? "?"} ${m.server?.version ?? ""}`);
+  console.log(`  Publisher:  ${m.publisher?.keyId ?? "?"}`);
+  console.log(`  Identity:   ${m.manifestDigest}`);
+  console.log(`  Signed:     ${m.signature ? `yes (${m.signature.algorithm}, keyId=${m.signature.keyId})` : "no"}`);
+  console.log(`  Issued:     ${m.issuedAt ?? "?"}`);
+  console.log(`  Expires:    ${m.expiresAt ?? "never"}${m.expiresAt && Date.parse(m.expiresAt) < Date.now() ? " (EXPIRED)" : ""}`);
+  console.log(`  Verified:   ${v.ok ? "yes" : "NO"}`);
+  if (!v.ok) {
+    console.log(`  Errors:`);
+    for (const e of v.errors) console.log(`    - ${e}`);
+  }
+  console.log(`  Tools:      ${m.tools?.length ?? 0}`);
+  if (m.tools) {
+    console.log("");
+    console.log("  Tools:");
+    for (const t of m.tools) {
+      console.log(`    ${t.name.padEnd(36)} schema=${(m.toolDigests?.[t.name] ?? "?").slice(0, 16)}`);
+    }
+  }
+}
+
+function inspectPinStore(data, file) {
+  const servers = Object.keys(data.servers ?? {});
+  const publishers = Object.keys(data.publishers ?? {});
+  const descriptors = Object.keys(data.descriptors ?? {});
+  console.log(`Trustcard Pin Store: ${file}`);
+  console.log("─".repeat(60));
+  console.log(`  Schema:      ${data.schema}`);
+  console.log(`  Server pins: ${servers.length}`);
+  console.log(`  Publisher pins: ${publishers.length}`);
+  console.log(`  Descriptor pins: ${descriptors.length}`);
+  if (data.corrupt) console.log(`  ⚠ CORRUPT — file was unreadable, started empty`);
+  if (servers.length > 0) {
+    console.log("");
+    console.log("  Server pins:");
+    for (const k of servers) {
+      const p = data.servers[k];
+      console.log(`    ${k.padEnd(36)} pinned=${p.firstPinnedAt ?? "?"} repins=${p.repinCount ?? 0}`);
+    }
+  }
+  if (publishers.length > 0) {
+    console.log("");
+    console.log("  Publisher pins:");
+    for (const k of publishers) {
+      const p = data.publishers[k];
+      console.log(`    ${k.slice(0, 24).padEnd(28)} firstSeen=${p.firstSeen ?? "?"} source=${p.source ?? "?"}`);
+    }
+  }
+}
+
 async function main() {
   const cmd = argv[0];
   if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") return usage();
@@ -509,6 +617,7 @@ async function main() {
     case "scan": return cmdScan();
     case "scan-config": return cmdScanConfig();
     case "gen-manifest": return cmdGenManifest();
+    case "inspect": return cmdInspect();
     case "fingerprint": return cmdFingerprint();
     case "manifest": return cmdManifest();
     case "keygen": return cmdKeygen();

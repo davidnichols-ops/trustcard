@@ -137,6 +137,20 @@ PINNED
            REVOKED
 ```
 
+For human-facing UIs and high-level APIs, these six internal states project
+onto four trust levels:
+
+```text
+Internal state    Trust level    Meaning
+──────────────    ───────────    ──────────────────
+PINNED            TRUSTED        Green — verified, calls allowed
+OBSERVED          OBSERVED       Yellow — seen but not pinned
+SUSPECT           OBSERVED       Yellow — something looks off
+UNKNOWN           OBSERVED       Yellow — never seen
+MISMATCH          UNTRUSTED      Red — contract changed
+REVOKED           REVOKED        Red — terminal, human re-pin required
+```
+
 A later connection is not merely:
 
 ```text
@@ -408,10 +422,22 @@ Capabilities can change after the scan.
 The proxy enforces an approved manifest at runtime:
 
 ```bash
+# Generate a manifest (includes danger analysis + 90-day expiry by default)
 mcp-trustcard gen-manifest \
   @modelcontextprotocol/server-memory \
   --save-manifest memory.json
 
+# For local commands (e.g. a Python server):
+mcp-trustcard gen-manifest \
+  --save-manifest my-server.json \
+  --allow-tool dangerous_but_reviewed_tool \
+  --expires-in 30 \
+  -- uv run my-server mcp serve
+
+# Inspect a manifest or pin store
+mcp-trustcard inspect memory.json
+
+# Enforce at call time (stdio)
 mcp-proxy \
   --manifest memory.json \
   -- npx -y @modelcontextprotocol/server-memory
@@ -434,6 +460,7 @@ The proxy can detect:
 - changed schemas
 - unapproved calls
 - manifest drift
+- manifest expiration
 
 It can then:
 
@@ -444,6 +471,25 @@ BLOCK
 ```
 
 according to policy.
+
+### Manifest expiration
+
+Manifests carry an `expiresAt` timestamp (default: 90 days). An expired
+manifest blocks all calls until regenerated, ensuring the danger analysis
+stays fresh. Override with `--expires-in <days>` or `--no-expiry`.
+
+### Tool overrides
+
+Tools flagged as dangerous by the danger detector can be explicitly allowed
+with `--allow-tool <name>` (repeatable). The override is recorded in the
+manifest as `manualOverride: true` so it's visible in audit. Use this only
+for tools you've reviewed and that have their own safety constraints.
+
+### Why blocked?
+
+Every denial includes a structured explanation — not just "DENIED" but
+the tool name, the reason code (`MANIFEST_EXPIRED`, `TOOL_NOT_APPROVED`,
+`DANGEROUS_TOOL`), the danger score, and the action to take.
 
 ## Signed, chained receipts
 
@@ -507,6 +553,8 @@ The goal is simple:
 
 ## What trustcard does not claim
 
+For the full guarantees table, see [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md).
+
 Trustcard is not a sandbox.
 
 A signed capability can still be malicious.
@@ -542,6 +590,7 @@ Those are complementary controls.
 
 ## Documentation
 
+- [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) — **what trustcard guarantees and what it doesn't** (read this first)
 - [`docs/SPEC.md`](docs/SPEC.md) — normative protocol specification
 - [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) — threats and non-goals
 - [`docs/DESCRIPTOR.md`](docs/DESCRIPTOR.md) — protocol-neutral capability descriptors
@@ -550,6 +599,7 @@ Those are complementary controls.
 - [`docs/AUDIT-REPORT-v2.md`](docs/AUDIT-REPORT-v2.md) — adversarial architecture audit
 - [`docs/REGISTRY-INTEGRATION.md`](docs/REGISTRY-INTEGRATION.md) — registry integration
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — v0.x → v1
+- [`examples/production-agent/`](examples/production-agent/) — reference deployment architecture
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
 
 ## Development

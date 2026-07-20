@@ -95,6 +95,47 @@ function sendToServer(msg) {
   server.stdin.write(JSON.stringify(msg) + "\n");
 }
 
+// Build a human-readable explanation for a denied call.
+// Returns a structured object suitable for display to the agent or user.
+function explainDenial(check, toolName, manifest) {
+  const entry = manifest.tools.find((t) => t.name === toolName);
+
+  // Manifest expired
+  if (check.reason.startsWith("manifest expired")) {
+    return {
+      tool: toolName,
+      reason: "MANIFEST_EXPIRED",
+      explanation: "The approved manifest has expired. The danger analysis is stale.",
+      manifestExpiresAt: manifest.expiresAt,
+      action: "Regenerate the manifest with: mcp-trustcard gen-manifest --save-manifest <file> -- <server-cmd>",
+    };
+  }
+
+  // Tool not in manifest
+  if (!entry) {
+    return {
+      tool: toolName,
+      reason: "TOOL_NOT_APPROVED",
+      explanation: `Tool "${toolName}" is not in the approved manifest. It may be new, or the manifest was generated for a different server.`,
+      approvedTools: manifest.tools.map((t) => t.name),
+      action: "Regenerate the manifest to include the new tool, or remove the call.",
+    };
+  }
+
+  // Tool blocked as dangerous
+  return {
+    tool: toolName,
+    reason: "DANGEROUS_TOOL",
+    explanation: `Tool "${toolName}" was flagged as dangerous by the trustcard danger detector.`,
+    dangerScore: entry.dangerScore,
+    dangerConfidence: entry.dangerConfidence,
+    schemaHash: entry.schemaHash,
+    action: entry.manualOverride
+      ? "This tool was manually overridden but is still blocked. Check the manifest."
+      : "If this tool has its own safety constraints, regenerate the manifest with --allow-tool to override.",
+  };
+}
+
 // Handle a JSON-RPC message from the CLIENT (client → proxy)
 function handleClientMessage(msg) {
   if (msg.method === "tools/call" && msg.id != null) {
@@ -102,12 +143,15 @@ function handleClientMessage(msg) {
     const check = checkCall(manifest, toolName);
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
+      // Build a human-readable explanation for the error response.
+      const explanation = explainDenial(check, toolName, manifest);
       sendToClient({
         jsonrpc: "2.0",
         id: msg.id,
         error: {
           code: -32601,
           message: `mcp-proxy: ${check.reason}`,
+          data: explanation,
         },
       });
       return;
