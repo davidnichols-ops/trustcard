@@ -514,11 +514,55 @@ with `--allow-tool <name>` (repeatable). The override is recorded in the
 manifest as `manualOverride: true` so it's visible in audit. Use this only
 for tools you've reviewed and that have their own safety constraints.
 
+### Per-agent auth scopes
+
+The proxy can enforce per-agent authorization using OAuth 2.1 token scopes.
+Tools declare `requiredScopes` in the manifest; the proxy validates a bearer
+token against those scopes before forwarding the call.
+
+```bash
+# 1. Generate a manifest with scope requirements
+mcp-trustcard gen-manifest \
+  --save-manifest my-server.json \
+  --require-scopes delete_file=write:files \
+  --require-scopes *:read:files \
+  -- uv run my-server mcp serve
+
+# 2. Issue a dev-mode token (for local development)
+export TRUSTCARD_AUTH_SECRET="my-shared-secret"
+TOKEN=$(mcp-trustcard auth-issue \
+  --subject agent-readonly \
+  --scopes read:files \
+  --secret "$TRUSTCARD_AUTH_SECRET" \
+  --quiet)
+
+# 3. Start the proxy with auth enforcement
+MCP_AUTH_TOKEN="$TOKEN" mcp-proxy \
+  --manifest my-server.json \
+  --auth-secret "$TRUSTCARD_AUTH_SECRET" \
+  -- uv run my-server mcp serve
+```
+
+For external OAuth 2.1 providers (Auth0, Okta, Keycloak, GitHub):
+
+```bash
+mcp-proxy \
+  --manifest my-server.json \
+  --auth-introspect https://your-idp/oauth/introspect \
+  --auth-client-id $CLIENT_ID \
+  --auth-client-secret $CLIENT_SECRET \
+  -- npx -y @modelcontextprotocol/server-github
+```
+
+Scope matching supports wildcards: `*` matches everything, `read:*` matches
+`read:files`, `read:db`, etc. A call is allowed only if every required scope
+is satisfied by the token's granted scopes.
+
 ### Why blocked?
 
 Every denial includes a structured explanation — not just "DENIED" but
 the tool name, the reason code (`MANIFEST_EXPIRED`, `TOOL_NOT_APPROVED`,
-`DANGEROUS_TOOL`), the danger score, and the action to take.
+`DANGEROUS_TOOL`, `INSUFFICIENT_SCOPES`), the danger score, and the action to take.
 
 ## Signed, chained receipts
 

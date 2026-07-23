@@ -1,5 +1,52 @@
 # Changelog
 
+## [2.3.0] — 2026-07-22
+
+Per-agent auth scope enforcement. Tools can now declare `requiredScopes` in
+the manifest, and the proxy validates a bearer token against those scopes
+before forwarding the call to the server. Closes the "No Support for Complex
+Auth Models" gap from the v2.2 threat model analysis.
+
+### Added
+
+- **`lib/auth.js`** — new module: `DevIssuer` (HMAC-SHA256 JWT-like tokens
+  for local dev), `IdpIntrospector` (RFC 7662 OAuth 2.1 token introspection
+  for external IdPs — Auth0, Okta, Keycloak, GitHub), `TokenValidator`
+  (combines both — tries local first, falls back to introspection),
+  `scopeSatisfies` (wildcard scope matching: `*` and `prefix:*`),
+  `extractToken`/`stripAuth` (token extraction from MCP requests + metadata
+  stripping before forwarding).
+- **`requiredScopes` in manifest** — `buildManifest` now accepts a
+  `scopeOverrides` parameter. Tools can declare scopes via
+  `annotations._meta.requiredScopes` (server-declared) or `--require-scopes`
+  CLI flag (operator-declared). `checkCall` validates the caller's `AuthToken`
+  scopes against `requiredScopes` when auth is configured.
+- **`requireScopes` Gate 2 rule** — new policy predicate in `lib/policy.js`
+  for programmatic scope enforcement via the Guard. Supports per-tool or
+  global scope requirements, with configurable verdict (`deny` or
+  `require-approval`).
+- **Proxy auth flags** — `mcp-proxy` now accepts `--auth-secret <hex>`,
+  `--auth-introspect <url>`, `--auth-client-id`, `--auth-client-secret`,
+  `--auth-token-env`. The proxy extracts a bearer token from each
+  `tools/call` request (`_meta.auth.token` or `MCP_AUTH_TOKEN` env var),
+  validates it, and strips auth metadata before forwarding to the server.
+- **CLI subcommands** — `auth-issue` (issue a dev-mode token) and
+  `auth-verify` (verify a dev-mode token and print claims).
+- **`gen-manifest --require-scopes`** — repeatable flag to declare scope
+  requirements per tool. Format: `--require-scopes <tool>:<scope1,scope2>`.
+  Use `*` as tool name to apply to all tools.
+
+### Tests
+
+- 326 (283 + 43 new): scope matching (exact, wildcard, prefix, multi-require),
+  AuthToken validity/expiry/inactive, DevIssuer roundtrip/wrong-secret/expired/
+  no-expiry/malformed, token extraction from `_meta`/env/precedence, auth
+  metadata stripping, `checkCall` scope enforcement (no-token, sufficient,
+  insufficient, wildcard, expired, multi-scope), `buildManifest` scope
+  overrides (CLI, server-declared, precedence), `requireScopes` Gate 2 rule
+  (deny/allow/wildcard/per-tool/global/require-approval), `TokenValidator`
+  (dev-issued, empty, unknown format).
+
 ## [2.2.1] — 2026-07-19
 
 Patch release fixing two issues found in the v2.2.0 comparison report

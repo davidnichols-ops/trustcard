@@ -54,7 +54,10 @@ insufficient and what the protocol replaces it with.
 - `manifest.js` — proxy-enforcement manifest (separate from signed manifests).
   `buildManifest` includes `expiresAt` (default 90 days); `checkCall` blocks
   all calls when the manifest is expired. `--allow-tool` overrides record
-  `manualOverride: true` so the override is visible in audit.
+  `manualOverride: true` so the override is visible in audit. `--require-scopes`
+  adds `requiredScopes` per tool (from CLI, server annotations, or `_meta`).
+  `checkCall` validates the caller's `AuthToken` scopes against `requiredScopes`
+  when auth is configured — unscoped tools pass without a token.
 - `pin.js` — TOFU pin store (servers + publisher keys), atomic writes,
   fail-closed on corrupt file.
 - `session.js` — live connection: negotiates protocol, verifies handshake
@@ -67,8 +70,16 @@ insufficient and what the protocol replaces it with.
   frameworks; also re-verifies toolset digest on every `tools/list`.
 - `policy.js` — **Gate 2 (v2).** Per-invocation authorization: composable rule
   predicates (`denyTools`, `constrainArg`, `forbidArg`,
-  `restrictToolToEnvironments`, `requireApprovalForDestructive`) +
-  `ScopedDecisions` (per-relying-party decision cache). NOT a policy language.
+  `restrictToolToEnvironments`, `requireApprovalForDestructive`,
+  `requireScopes`) + `ScopedDecisions` (per-relying-party decision cache).
+  NOT a policy language. `requireScopes` checks the invocation's `authToken`
+  against required scopes (wildcard `*` and `prefix:*` supported).
+- `auth.js` — **(v2.3).** Per-agent auth scope enforcement. `DevIssuer`
+  (HMAC-SHA256 JWT-like tokens for local dev), `IdpIntrospector` (RFC 7662
+  OAuth 2.1 token introspection for external IdPs), `TokenValidator`
+  (combines both — tries local first, falls back to introspection),
+  `scopeSatisfies` (wildcard scope matching), `extractToken`/`stripAuth`
+  (token extraction from MCP requests + metadata stripping before forwarding).
 - `rotation.js` — **(v2).** Old-key-signs-new-key rotation certificates +
   self-signed revocation certificates (`buildRotationCertificate`,
   `verifyRotationCertificate`, `buildRevocationCertificate`,

@@ -5,13 +5,17 @@
 //   mcp-proxy --manifest <file> -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --strict -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --auto-update -- <server-cmd> [args...]
+//   mcp-proxy --manifest <file> --auth-secret <hex> -- <server-cmd> [args...]
+//   mcp-proxy --manifest <file> --auth-introspect <url> [--auth-client-id <id> --auth-client-secret <secret>] -- <server-cmd> [args...]
 //
 // The proxy spawns the real MCP server as a child process and transparently
 // forwards JSON-RPC messages, intercepting two methods:
 //
 //   tools/list  — compares the live tool list against the manifest, logs drift,
 //                 and optionally strips unapproved tools from the response.
-//   tools/call  — blocks calls to tools not in the manifest.
+//   tools/call  — blocks calls to tools not in the manifest, and (if auth is
+//                 configured) validates the caller's token scopes against the
+//                 tool's requiredScopes before forwarding.
 //
 // Modes:
 //   default      — logs drift to stderr, strips unapproved tools silently
@@ -19,12 +23,23 @@
 //   --auto-update — updates the manifest file on disk when new tools are detected,
 //                   then allows them through. Logs a warning for each update.
 //
+// Auth:
+//   --auth-secret <hex>      Enable dev-mode token validation with the given HMAC secret.
+//                            Tokens are issued by `mcp-trustcard auth-issue`.
+//   --auth-introspect <url>  Enable OAuth 2.1 token introspection against an external IdP.
+//   --auth-client-id <id>    Optional: client credentials for authenticated introspection.
+//   --auth-client-secret <s> Optional: client secret for authenticated introspection.
+//   --auth-token-env <var>   Environment variable to read a session-level token from
+//                            (default: MCP_AUTH_TOKEN). Per-call tokens in _meta.auth.token
+//                            take precedence.
+//
 // All other methods pass through untouched. The proxy is client-agnostic:
 // any MCP client that speaks stdio JSON-RPC works without modification.
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { buildManifest, diffManifest, checkCall } from "../lib/manifest.js";
 import { redact } from "../lib/redact.js";
+import { DevIssuer, IdpIntrospector, TokenValidator, extractToken, stripAuth } from "../lib/auth.js";
 
 const args = process.argv.slice(2);
 
@@ -33,6 +48,39 @@ const strictMode = args.includes("--strict");
 const autoUpdate = args.includes("--auto-update");
 const cwdIdx = args.indexOf("--cwd");
 const cwd = cwdIdx !== -1 && args[cwdIdx + 1] ? args[cwdIdx + 1] : undefined;
+
+// Parse auth flags
+const authSecretIdx = args.indexOf("--auth-secret");
+const authSecret = authSecretIdx !== -1 && args[authSecretIdx + 1] ? args[authSecretIdx + 1] : null;
+
+const authIntrospectIdx = args.indexOf("--auth-introspect");
+const authIntrospectUrl = authIntrospectIdx !== -1 && args[authIntrospectIdx + 1] ? args[authIntrospectIdx + 1] : null;
+
+const authClientIdIdx = args.indexOf("--auth-client-id");
+const authClientId = authClientIdIdx !== -1 && args[authClientIdIdx + 1] ? args[authClientIdIdx + 1] : null;
+
+const authClientSecretIdx = args.indexOf("--auth-client-secret");
+const authClientSecret = authClientSecretIdx !== -1 && args[authClientSecretIdx + 1] ? args[authClientSecretIdx + 1] : null;
+
+const authTokenEnvIdx = args.indexOf("--auth-token-env");
+const authTokenEnv = authTokenEnvIdx !== -1 && args[authTokenEnvIdx + 1] ? args[authTokenEnvIdx + 1] : "MCP_AUTH_TOKEN";
+
+// Build token validator if any auth mode is configured
+let tokenValidator = null;
+if (authSecret || authIntrospectUrl) {
+  const components = {};
+  if (authSecret) {
+    components.devIssuer = new DevIssuer({ secret: authSecret });
+  }
+  if (authIntrospectUrl) {
+    components.idpIntrospector = new IdpIntrospector({
+      introspectionEndpoint: authIntrospectUrl,
+      clientId: authClientId,
+      clientSecret: authClientSecret,
+    });
+  }
+  tokenValidator = new TokenValidator(components);
+}
 
 // Parse --manifest <file>
 const manifestIdx = args.indexOf("--manifest");
@@ -123,6 +171,16 @@ function explainDenial(check, toolName, manifest) {
   }
 
   // Tool blocked as dangerous
+  if (entry && entry.allowed !== false) {
+    // If the tool is allowed but the call was denied, it's a scope issue
+    return {
+      tool: toolName,
+      reason: "INSUFFICIENT_SCOPES",
+      explanation: check.reason,
+      requiredScopes: entry.requiredScopes ?? [],
+      action: "Provide a token with the required scopes. Use `mcp-trustcard auth-issue` to issue a dev token.",
+    };
+  }
   return {
     tool: toolName,
     reason: "DANGEROUS_TOOL",
@@ -137,10 +195,35 @@ function explainDenial(check, toolName, manifest) {
 }
 
 // Handle a JSON-RPC message from the CLIENT (client → proxy)
-function handleClientMessage(msg) {
+async function handleClientMessage(msg) {
   if (msg.method === "tools/call" && msg.id != null) {
     const toolName = msg.params?.name;
-    const check = checkCall(manifest, toolName);
+
+    // Auth: extract and validate token if auth is configured.
+    // The token is validated once per call and passed to checkCall for scope checking.
+    let authToken = null;
+    if (tokenValidator) {
+      const rawToken = extractToken(msg, authTokenEnv);
+      if (rawToken) {
+        try {
+          authToken = await tokenValidator.validate(rawToken);
+        } catch (e) {
+          log(`AUTH ERROR: token validation failed: ${e.message}`);
+          sendToClient({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32600,
+              message: `mcp-proxy: token validation failed: ${e.message}`,
+              data: { reason: "AUTH_VALIDATION_ERROR", error: e.message },
+            },
+          });
+          return;
+        }
+      }
+    }
+
+    const check = checkCall(manifest, toolName, msg.params?.arguments ?? {}, authToken);
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
       // Build a human-readable explanation for the error response.
@@ -156,9 +239,9 @@ function handleClientMessage(msg) {
       });
       return;
     }
-    // Approved — forward to server
+    // Approved — strip auth metadata and forward to server
     pendingServer.set(msg.id, "tools/call");
-    sendToServer(msg);
+    sendToServer(tokenValidator ? stripAuth(msg) : msg);
     return;
   }
 
@@ -284,7 +367,9 @@ process.stdin.on("data", (data) => {
     if (!line) continue;
     try {
       const msg = JSON.parse(line);
-      handleClientMessage(msg);
+      handleClientMessage(msg).catch((e) => {
+        log(`ERROR handling client message: ${e.message}`);
+      });
     } catch {
       // Not valid JSON — forward raw to server
       server.stdin.write(line + "\n");
@@ -338,4 +423,8 @@ process.on("SIGINT", () => {
 });
 
 const modeLabel = strictMode ? "strict" : autoUpdate ? "auto-update" : "default";
-log(`proxy started — mode: ${modeLabel}, manifest: ${manifest.tools.length} tools, server: ${serverCmd} ${serverArgs.join(" ")}`);
+const authLabel = tokenValidator
+  ? `auth: ${authSecret ? "dev-issuer" : ""}${authIntrospectUrl ? "idp-introspect" : ""}`
+  : "auth: off";
+const scopedTools = manifest.tools.filter((t) => t.requiredScopes?.length > 0).length;
+log(`proxy started — mode: ${modeLabel}, ${authLabel}, manifest: ${manifest.tools.length} tools (${scopedTools} scoped), server: ${serverCmd} ${serverArgs.join(" ")}`);

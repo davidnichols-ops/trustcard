@@ -1,7 +1,7 @@
 {
   "name": "mcp-trustcard",
-  "version": "2.2.1",
-  "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, capability descriptors, a two-gate invocation policy, signed+chained receipts, and publisher key rotation. Also the \"npm audit\" health-check / public trust card for every Model Context Protocol server.",
+  "version": "2.3.0",
+  "description": "Cryptographic trust infrastructure for MCP servers — content-addressed tool identity, signed manifests, TOFU pinning, capability descriptors, a two-gate invocation policy, signed+chained receipts, publisher key rotation, and per-agent OAuth 2.1 auth scope enforcement. Also the \"npm audit\" health-check / public trust card for every Model Context Protocol server.",
   "type": "module",
   "bin": {
     "mcp-trustcard": "bin/mcp-trustcard.js",
@@ -35,7 +35,10 @@
     "supply-chain",
     "audit",
     "healthcheck",
-    "agents"
+    "agents",
+    "oauth",
+    "authorization",
+    "scopes"
   ],
   "license": "MIT",
   "author": "davidnichols-ops",

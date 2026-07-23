@@ -34,6 +34,7 @@ For the protocol design rationale, see [TRUST-SUBSTRATE.md](TRUST-SUBSTRATE.md).
 | Enforce rotation freshness | **Yes** | Rotation certificates carry `expiresAt`; `verifyRotationCertificate` rejects lapsed certs. Revocation has no expiry by design. | `lib/rotation.js` |
 | Detect dangerous tool capabilities | **Partial** | Three-engine static analysis: (1) heuristic verb/param matching with context-aware scoring, (2) TF-IDF semantic similarity, (3) prompt-injection marker detection (`<IMPORTANT>`, `[SYSTEM OVERRIDE]`, "ignore previous instructions", sensitive file paths, secrecy instructions). Catches declared destructive capabilities and description weaponization. Cannot detect a tool that *lies* in its description without using known injection patterns. | `lib/danger-detector.js` |
 | Close TOCTOU window (discovery → call) | **Partial** | Fully closed for cooperating servers (handshake binding). For non-cooperating servers, bounded by `list_changed` re-diff + strict arg validation + receipts. Not eliminated. | `lib/session.js` |
+| Enforce per-agent auth scopes | **Yes** (with auth configured) | Tools declare `requiredScopes` in the manifest. The proxy extracts a bearer token from each `tools/call` request, validates it (dev-issuer HMAC or OAuth 2.1 introspection), and blocks calls where the token's scopes don't satisfy the tool's requirements. Wildcard scopes (`*`, `read:*`) supported. | `lib/auth.js`, `lib/manifest.js`, `bin/mcp-proxy.js` |
 | **Prove tool behavior** | **No** | Out of scope. trustcard pins the *contract* (definition), not what the code does when called. A signed read-only tool can still behave badly. | — |
 | **Prevent malicious publishers** | **No** | Out of scope for cryptography. Signatures prove provenance, not intent. The scanner and social accountability are the mitigation. | — |
 | **Guarantee publisher key safety** | **No** | Key compromise is a standard key-hygiene problem. Rotation is break-glass (old key signs new). No HSM/KMS integration. | — |
@@ -128,6 +129,73 @@ override with `--expires-in <days>` on `gen-manifest`.
 An expired proxy manifest means the agent must re-generate it (re-run
 `gen-manifest`), which re-runs the danger detector against the current
 tool definitions. This ensures the danger analysis is fresh.
+
+## Per-agent auth scopes (OAuth 2.1 + dev issuer)
+
+trustcard enforces per-agent authorization at the proxy layer. Tools can
+declare `requiredScopes` in the manifest, and the proxy validates a bearer
+token against those scopes before forwarding the call to the server.
+
+### How scopes are declared
+
+Scopes come from three sources (in priority order):
+
+1. **CLI override**: `gen-manifest --require-scopes <tool>:<scope1,scope2>`
+   (repeatable). Use `*` as the tool name to apply to all tools.
+2. **Server-declared**: `tool.annotations._meta.requiredScopes` — the server
+   advertises what scopes its tools need.
+3. **None**: a tool without `requiredScopes` is unscoped — any valid token
+   (or no token at all) can call it.
+
+### How tokens are validated
+
+The proxy supports two token sources, configurable via CLI flags:
+
+- **Dev issuer** (`--auth-secret <hex>`): HMAC-SHA256-signed JWT-like tokens
+  issued by `mcp-trustcard auth-issue`. For local development only — no
+  refresh tokens, no revocation, no PKCE flow.
+- **External IdP** (`--auth-introspect <url>`): RFC 7662 token introspection
+  against any OAuth 2.1 provider (Auth0, Okta, Keycloak, GitHub). Supports
+  authenticated introspection via `--auth-client-id` / `--auth-client-secret`.
+  Results are cached for 60 seconds by default.
+
+Both can be active simultaneously — the proxy tries local verification first
+(fast, no network), then falls back to IdP introspection.
+
+### How tokens are extracted
+
+The proxy looks for the token in two places (first match wins):
+
+1. **Per-call**: `params._meta.auth.token` or `params._meta.authorization`
+   (Bearer header style) on the `tools/call` request.
+2. **Session-level**: the `MCP_AUTH_TOKEN` environment variable (override
+   with `--auth-token-env`).
+
+Auth metadata is stripped from the request before forwarding to the server —
+the server never sees the trustcard-internal auth fields.
+
+### Scope matching
+
+Scopes are strings: `read:files`, `write:db`, `admin`, etc. Matching supports
+wildcards:
+
+- `*` matches everything
+- `read:*` matches `read:files`, `read:db`, etc.
+
+A call is allowed only if every required scope is satisfied by the token's
+granted scopes. Missing scopes are reported in the denial message.
+
+### Gate 2 integration
+
+In addition to the proxy-layer check, `requireScopes` is available as a Gate 2
+policy rule (`lib/policy.js`) for programmatic use via the Guard. This allows
+scope checks to be combined with other invocation policies (environment
+restrictions, argument constraints, destructive-tool approval) in a single
+policy chain.
+
+**Code:** `lib/auth.js` (token validation), `lib/manifest.js` (scope check in
+`checkCall`), `lib/policy.js` (`requireScopes` rule), `bin/mcp-proxy.js`
+(proxy enforcement).
 
 ## Schema versioning and migration
 

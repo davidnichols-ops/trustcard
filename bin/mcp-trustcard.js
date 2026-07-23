@@ -77,8 +77,10 @@ Health scorecard (scanner):
   mcp-trustcard scan --batch servers.json [--json-out results.json] [--parallel n]
   mcp-trustcard scan-config <config.json>      # scan an MCP config for exposed secrets
   mcp-trustcard gen-manifest <spec> --save-manifest <file>   # proxy-enforcement manifest
-  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...] [--expires-in <days>|--no-expiry]
+  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...] [--require-scopes <tool>:<s1,s2>] [--expires-in <days>|--no-expiry]
   mcp-trustcard inspect <file>                 # inspect a manifest or pin store
+  mcp-trustcard auth-issue --subject <id> --scopes <s1,s2> --secret <hex>  # issue a dev-mode token
+  mcp-trustcard auth-verify <token> --secret <hex>  # verify a dev-mode token
   mcp-trustcard <spec>                         # shorthand for scan
 
 Options: --json  --no-color  --pins <path>  --env-file <f>  --cwd <dir>
@@ -301,6 +303,27 @@ async function cmdGenManifest() {
     }
   }
 
+  // Collect --require-scopes <tool>:<scope1,scope2,...> overrides (can be repeated).
+  // Format: --require-scopes read_file=read:files,write:disk
+  // Special case: --require-scopes *:read:files applies to all tools.
+  const scopeOverrides = {};
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--require-scopes" && argv[i + 1]) {
+      const spec = argv[i + 1];
+      const colonIdx = spec.indexOf(":");
+      if (colonIdx === -1) { console.error(`--require-scopes: expected <tool>:<scope1,scope2,...>, got "${spec}"`); process.exit(2); }
+      const tool = spec.slice(0, colonIdx);
+      const scopes = spec.slice(colonIdx + 1).split(",").map((s) => s.trim()).filter(Boolean);
+      if (tool === "*") {
+        // Apply to all tools — we'll handle this after we enumerate them.
+        scopeOverrides["*"] = scopes;
+      } else {
+        scopeOverrides[tool] = scopes;
+      }
+      i++;
+    }
+  }
+
   // Expiry override: --expires-in <days> (default 90). --no-expiry disables.
   const expiresFlag = opt("--expires-in");
   const expiresInDays = expiresFlag === "none" || argv.includes("--no-expiry")
@@ -344,7 +367,17 @@ async function cmdGenManifest() {
     client.notify("notifications/initialized", {});
     const res = await client.request("tools/list", {}, 10_000);
     const tools = Array.isArray(res?.tools) ? res.tools : [];
-    const manifest = buildProxyManifest(tools, init?.serverInfo ?? null, specStr, allowTools, expiresInDays);
+    // Expand wildcard scope overrides to all tools
+    const finalScopeOverrides = {};
+    if (scopeOverrides["*"]) {
+      for (const t of tools) {
+        finalScopeOverrides[t.name] = scopeOverrides["*"];
+      }
+    }
+    Object.assign(finalScopeOverrides, scopeOverrides);
+    delete finalScopeOverrides["*"];
+    const manifest = buildProxyManifest(tools, init?.serverInfo ?? null, specStr, allowTools, expiresInDays,
+      Object.keys(finalScopeOverrides).length > 0 ? finalScopeOverrides : null);
     writeFileSync(outFile, JSON.stringify(manifest, null, 2));
     console.log(`Manifest saved: ${outFile}`);
     console.log(`  Server: ${manifest.serverInfo?.name ?? specStr}`);
@@ -354,9 +387,16 @@ async function cmdGenManifest() {
     if (allowTools.length > 0) {
       console.log(`  Overrides: ${allowTools.join(", ")}`);
     }
+    const scopedCount = manifest.tools.filter((t) => t.requiredScopes?.length > 0).length;
+    if (scopedCount > 0) {
+      console.log(`  Scoped tools: ${scopedCount}`);
+    }
     for (const t of manifest.tools) {
-      const flag = t.manualOverride ? " [override]" : "";
-      console.log(`    ${t.name.padEnd(32)} schema=${t.schemaHash}${flag}`);
+      const flags = [];
+      if (t.manualOverride) flags.push("override");
+      if (t.requiredScopes?.length) flags.push(`scopes=[${t.requiredScopes.join(",")}]`);
+      const flagStr = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
+      console.log(`    ${t.name.padEnd(32)} schema=${t.schemaHash}${flagStr}`);
     }
   } finally {
     await client.stop();
@@ -510,6 +550,68 @@ async function cmdPins() {
   console.log("");
 }
 
+// auth-issue: issue a dev-mode token (HMAC-signed JWT-like).
+// Usage: mcp-trustcard auth-issue --subject <agent-id> --scopes <scope1,scope2,...> [--secret <hex>] [--expires-in <seconds>]
+async function cmdAuthIssue() {
+  const { DevIssuer } = await import("../lib/auth.js");
+  const subject = opt("--subject") ?? positional(1)[0];
+  if (!subject) { console.error("auth-issue: missing --subject <agent-id>"); process.exit(2); }
+  const scopesStr = opt("--scopes") ?? "";
+  const scopes = scopesStr.split(",").map((s) => s.trim()).filter(Boolean);
+  const secret = opt("--secret") ?? process.env.TRUSTCARD_AUTH_SECRET;
+  if (!secret) { console.error("auth-issue: missing --secret <hex> (or set TRUSTCARD_AUTH_SECRET env var)"); process.exit(2); }
+  const expiresIn = parseInt(opt("--expires-in") ?? "3600", 10);
+
+  const issuer = new DevIssuer({ secret });
+  const token = issuer.issue({ subject, scopes, expiresInSeconds: expiresIn });
+
+  // Print the token and a decoded summary
+  console.log(token);
+  if (!flag("--quiet")) {
+    const decoded = issuer.verify(token);
+    console.error(`  subject: ${decoded.subject}`);
+    console.error(`  scopes:  ${decoded.scopes.join(", ")}`);
+    console.error(`  expires: ${decoded.expiresAt ?? "never"}`);
+    console.error(`  issuer:  ${decoded.issuer}`);
+  }
+}
+
+// auth-verify: verify a dev-mode token and print its claims.
+// Usage: mcp-trustcard auth-verify <token> --secret <hex>
+async function cmdAuthVerify() {
+  const { DevIssuer } = await import("../lib/auth.js");
+  const token = positional(1)[0];
+  if (!token) { console.error("auth-verify: missing <token>"); process.exit(2); }
+  const secret = opt("--secret") ?? process.env.TRUSTCARD_AUTH_SECRET;
+  if (!secret) { console.error("auth-verify: missing --secret <hex> (or set TRUSTCARD_AUTH_SECRET env var)"); process.exit(2); }
+
+  const issuer = new DevIssuer({ secret });
+  const decoded = issuer.verify(token);
+  if (!decoded) {
+    console.error("auth-verify: token is invalid (bad signature or malformed)");
+    process.exit(1);
+  }
+  if (decoded.isExpired) {
+    console.error(`auth-verify: token expired at ${decoded.expiresAt}`);
+    process.exit(1);
+  }
+  if (flag("--json")) {
+    console.log(JSON.stringify({
+      subject: decoded.subject,
+      scopes: decoded.scopes,
+      expiresAt: decoded.expiresAt,
+      issuer: decoded.issuer,
+      active: decoded.isValid,
+    }, null, 2));
+  } else {
+    console.log(`subject: ${decoded.subject}`);
+    console.log(`scopes:  ${decoded.scopes.join(", ")}`);
+    console.log(`expires: ${decoded.expiresAt ?? "never"}`);
+    console.log(`issuer:  ${decoded.issuer}`);
+    console.log(`active:  ${decoded.isValid}`);
+  }
+}
+
 // inspect: human-readable summary of a manifest or pin store.
 // Works on both proxy manifests (lib/manifest.js) and signed manifests
 // (lib/provenance.js). Detects which format by looking for `signature`.
@@ -627,6 +729,8 @@ async function main() {
     case "pin": return cmdPin();
     case "unpin": return cmdUnpin();
     case "pins": return cmdPins();
+    case "auth-issue": return cmdAuthIssue();
+    case "auth-verify": return cmdAuthVerify();
     default:
       if (!cmd.startsWith("-")) return cmdScan();
       usage();
