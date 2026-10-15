@@ -132,8 +132,8 @@ For local MCP servers that communicate over stdio JSON-RPC:
 3. **Unapproved tools are stripped** from `tools/list` responses. **Calls to unapproved tools are blocked** with a JSON-RPC error before reaching the server. **Schema drift** is logged.
 
 ```bash
-# Scan and save a manifest
-mcp-trustcard scan @modelcontextprotocol/server-filesystem --save-manifest fs.json
+# Generate and save a proxy-enforcement manifest
+mcp-trustcard gen-manifest @modelcontextprotocol/server-filesystem --save-manifest fs.json
 
 # Run the proxy (point your MCP client at this instead of the server)
 mcp-proxy --manifest fs.json -- npx -y @modelcontextprotocol/server-filesystem /path

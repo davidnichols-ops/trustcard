@@ -86,9 +86,9 @@ The proxy extracts the token, validates it, strips auth metadata, then forwards 
 
 ### Modified: `bin/mcp-trustcard.js`
 
-- `auth-issue --subject <name> --scopes <scopes> --secret <hex>` — issue a dev-mode token
-- `auth-verify --token <jwt> --secret <hex>` — verify a dev-mode token and print claims
-- `gen-manifest --require-scopes <tool>:<scope1,scope2>` — repeatable flag to declare scope requirements
+- `auth-issue --subject <name> --scopes <scopes> [--secret-file <path|->]` — issue a dev-mode token (secret also via `TRUSTCARD_AUTH_SECRET`; `--secret <hex>` works but exposes the key in the process list)
+- `auth-verify --token <jwt> [--secret-file <path|->]` — verify a dev-mode token and print claims
+- `gen-manifest --require-scopes <tool>=<scope1,scope2>` — repeatable flag to declare scope requirements (the older `tool:scope` form still parses)
 
 ## Quick Start
 
@@ -97,8 +97,8 @@ The proxy extracts the token, validates it, strips auth metadata, then forwards 
 npm install -g mcp-trustcard
 
 # Generate a manifest with scope requirements
-node bin/mcp-trustcard.js gen-manifest --require-scopes "write_file:files:write" \
-  --require-scopes "delete_file:files:delete,admin" \
+node bin/mcp-trustcard.js gen-manifest --require-scopes "write_file=files:write" \
+  --require-scopes "delete_file=files:delete,admin" \
   --save-manifest manifest.json -- npx @modelcontextprotocol/server-filesystem /tmp
 
 # Issue a dev-mode token for a read-only agent

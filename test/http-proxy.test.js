@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
-import { buildManifest } from "../lib/manifest.js";
+import { buildManifest, computeManifestHash } from "../lib/manifest.js";
 import { redact } from "../lib/redact.js";
 import { DevIssuer } from "../lib/auth.js";
 import { generatePublisherKeypair } from "../lib/provenance.js";
@@ -727,6 +727,7 @@ test('http auto-update preserves operator denial and explicit scopes', async () 
   const manifest = buildManifest([{ name: 'read_file', description: 'tool read_file', inputSchema: { type: 'object', properties: {} } }]);
   manifest.tools[0].allowed = false;
   manifest.tools[0].requiredScopes = ['admin:read'];
+  manifest.manifestHash = computeManifestHash(manifest.tools);
   const manifestPath = '/tmp/test-http-preserve-policy.json';
   writeFileSync(manifestPath, JSON.stringify(manifest));
   const { proxy, port } = await spawnHttpProxy(manifestPath, upstream.url, ['--auto-update']);

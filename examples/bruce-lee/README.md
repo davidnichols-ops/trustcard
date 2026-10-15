@@ -191,7 +191,7 @@ Test coverage:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BRUCE_LEE_LOG_PATH` | `./bruce-lee-decisions.jsonl` | Path to the append-only audit log |
+| `BRUCE_LEE_LOG_PATH` | `$TMPDIR/bruce-lee/bruce-lee-decisions.jsonl` | Path to the append-only audit log. The default lives under the OS temp dir so demos don't drop untracked files into the repo; `*.jsonl` here is gitignored either way. |
 | `BRUCE_LEE_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## Versioning

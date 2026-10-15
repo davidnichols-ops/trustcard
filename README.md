@@ -157,7 +157,7 @@ A trusted server is not automatically authorized to perform every call. Trust is
 
 ### 6. Behavioral verification
 
-Static identity can pass while runtime behavior diverges. `mcp-trustcard behavior` executes a server in a sandboxed harness, fires deterministic seeded probes, and compares observations against a refe[...] 
+Static identity can pass while runtime behavior diverges. `mcp-trustcard behavior` executes a server as a process-isolated stdio child (fresh cwd, minimal environment — not an OS sandbox), fires deterministic seeded probes, and compares observations against a reference baseline.
 
 It catches:
 
@@ -427,21 +427,22 @@ The proxy can enforce per-agent authorization using OAuth 2.1 token scopes:
 mcp-trustcard gen-manifest \
   --save-manifest my-server.json \
   --require-scopes delete_file=write:files \
-  --require-scopes *:read:files \
+  --require-scopes *=read:files \
   -- uv run my-server mcp serve
 
 # 2. Issue a dev-mode token (for local development)
+# Secrets go via TRUSTCARD_AUTH_SECRET or --secret-file <path|->;
+# --secret <hex> works but exposes the key in the process list.
 export TRUSTCARD_AUTH_SECRET="my-shared-secret"
 TOKEN=$(mcp-trustcard auth-issue \
   --subject agent-readonly \
   --scopes read:files \
-  --secret "$TRUSTCARD_AUTH_SECRET" \
   --quiet)
 
 # 3. Start the proxy with auth enforcement
 MCP_AUTH_TOKEN="$TOKEN" mcp-proxy \
   --manifest my-server.json \
-  --auth-secret "$TRUSTCARD_AUTH_SECRET" \
+  --auth-secret-file <(echo "$TRUSTCARD_AUTH_SECRET") \
   -- uv run my-server mcp serve
 ```
 
@@ -462,7 +463,7 @@ Scope matching supports wildcards: `*` matches everything, `read:*` matches `rea
 
 Static trust tells you the contract has not changed. It does not tell you the running code honors the contract.
 
-`mcp-trustcard behavior` runs the server in a sandboxed stdio harness, fires deterministic probes, and compares the results against a captured reference or baseline expectations.
+`mcp-trustcard behavior` runs the server as a process-isolated stdio child (fresh cwd and minimal environment — not an OS sandbox; the child can still reach the network and filesystem), fires deterministic probes, and compares the results against a captured reference or baseline expectations.
 
 ```bash
 mcp-trustcard behavior <manifest.json> [--server <spec>] [--json]

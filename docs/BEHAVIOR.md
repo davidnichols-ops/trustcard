@@ -3,8 +3,10 @@
 > **Current as of trustcard v3.0.3.** For the long-term vision, see
 > [`ROADMAP-2Y.md`](ROADMAP-2Y.md).
 
-`mcp-trustcard behavior` executes a server in a sandboxed stdio harness, fires
-deterministic seeded probes, and compares what it actually does against a
+`mcp-trustcard behavior` executes a server as a process-isolated stdio child —
+fresh working directory and minimal environment, **not** an OS sandbox (the
+child can still reach the network and filesystem). It fires deterministic
+seeded probes, and compares what the server actually does against a
 reference observation or its own runtime expectations.
 
 It answers a question the static trust substrate cannot: **does the running
@@ -61,13 +63,15 @@ artifacts.
 5. A finding's `confidence` reflects the strength of the evidence, not a
    guarantee of exploitability.
 
-## Sandbox semantics
+## Harness semantics
 
-`SandboxRuntime` (`lib/behavior.js`) launches the server as an MCP stdio child:
+`SandboxRuntime` (`lib/behavior.js`) launches the server as an MCP stdio child.
+(The class name predates the honest-labeling pass — it is a **process harness**,
+not an OS sandbox; it does not restrict network, filesystem, or subprocesses.)
 
 - `cwd` is a fresh temp directory by default, or a caller-provided directory.
 - Environment is minimal (`PATH` plus `HOME`/`TMPDIR`/`TEMP` mapped to the
-  sandbox `cwd`). Use `inheritEnv: true` only when the server genuinely needs
+  harness `cwd`). Use `inheritEnv: true` only when the server genuinely needs
   the caller's environment.
 - `detached: true` runs the child in its own process group and kills the
   whole group on stop.
@@ -230,6 +234,6 @@ The first roadmap gate after v3.0.3 is **behavior → evidence bridge**
 queryable with `mcp-trustcard evidence query --subject <server>`.
 
 Other near-term work includes HTTP/SSE transport parity for the behavioral
-sandbox, a real-world reference corpus, and an observatory scheduler. Deep
+harness, a real-world reference corpus, and an observatory scheduler. Deep
 containment (OS-level namespaces, TEE attestation, syscall tracing) is an
 explicit Y2 goal and must remain optional and truthfully labeled.

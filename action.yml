@@ -12,6 +12,10 @@ inputs:
     description: "Minimum score (0-100) required to pass. Default 50."
     required: false
     default: "50"
+  package-version:
+    description: "Published npm version of mcp-trustcard to run. Pinned on purpose — bump deliberately, never @latest."
+    required: false
+    default: "3.1.0"
   json-out:
     description: "Path to write the JSON report. Optional."
     required: false
@@ -34,44 +38,66 @@ runs:
 
     - name: Run mcp-trustcard
       shell: bash
+      env:
+        TRUSTCARD_PKG: "mcp-trustcard@${{ inputs.package-version }}"
+        TRUSTCARD_SERVER: "${{ inputs.server }}"
+        TRUSTCARD_SCAN_CONFIG: "${{ inputs.scan-config }}"
+        TRUSTCARD_MIN_SCORE: "${{ inputs.min-score }}"
+        TRUSTCARD_JSON_OUT: "${{ inputs.json-out }}"
+        TRUSTCARD_SAVE_MANIFEST: "${{ inputs.save-manifest }}"
       run: |
         set -euo pipefail
 
-        # Config file secret scanning mode
-        if [ -n "${{ inputs.scan-config }}" ]; then
-          echo "Scanning ${{ inputs.scan-config }} for exposed secrets..."
-          npx -y mcp-trustcard@latest scan-config "${{ inputs.scan-config }}"
+        # Config file secret scanning mode — scan-config exits nonzero when it
+        # finds secrets, and that failure is the point of the check.
+        if [ -n "$TRUSTCARD_SCAN_CONFIG" ]; then
+          echo "Scanning $TRUSTCARD_SCAN_CONFIG for exposed secrets..."
+          npx -y "$TRUSTCARD_PKG" scan-config "$TRUSTCARD_SCAN_CONFIG"
           exit 0
         fi
 
         # Server scan mode (default)
-        if [ -z "${{ inputs.server }}" ]; then
+        if [ -z "$TRUSTCARD_SERVER" ]; then
           echo "::error::Either 'server' or 'scan-config' input is required"
           exit 1
         fi
 
-        # Single scan — capture JSON and print text report
-        npx -y mcp-trustcard@latest --json "${{ inputs.server }}" > report.json 2>/dev/null || true
-        npx -y mcp-trustcard@latest "${{ inputs.server }}" || true
+        # Single scan, machine-readable. `scan` exits nonzero when the score is
+        # below the threshold — capture the code, don't die on it yet.
+        set +e
+        npx -y "$TRUSTCARD_PKG" scan "$TRUSTCARD_SERVER" --json --threshold "$TRUSTCARD_MIN_SCORE" > report.json
+        scan_rc=$?
+        set -e
 
-        # Extract score from the JSON report
-        score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('report.json','utf8')).score)}catch{console.log(0)}")
-        echo "Score: $score (min: ${{ inputs.min-score }})"
+        # A parseable report means the scan actually ran. Anything else is a
+        # hard failure (bad spec, spawn error, CLI error) — surface it, don't
+        # quietly score it as zero.
+        if ! node -e 'const r=JSON.parse(require("fs").readFileSync("report.json","utf8"));if(typeof r.score!=="number")process.exit(1)' 2>/dev/null; then
+          echo "::error::trustcard scan did not produce a JSON report (exit $scan_rc):"
+          cat report.json
+          exit 1
+        fi
+
+        score=$(node -p 'JSON.parse(require("fs").readFileSync("report.json","utf8")).score')
+        echo "Trust score: $score/100 (minimum: $TRUSTCARD_MIN_SCORE)"
+        node -e 'const r=JSON.parse(require("fs").readFileSync("report.json","utf8"));for(const[k,c]of Object.entries(r.checks??{}))console.log(`  ${String(c.status).padEnd(8)} ${k.padEnd(18)} ${c.detail??""}`)'
 
         # Save JSON report if requested
-        if [ -n "${{ inputs.json-out }}" ]; then
-          cp report.json "${{ inputs.json-out }}"
-          echo "Report saved to ${{ inputs.json-out }}"
+        if [ -n "$TRUSTCARD_JSON_OUT" ]; then
+          cp report.json "$TRUSTCARD_JSON_OUT"
+          echo "Report saved to $TRUSTCARD_JSON_OUT"
         fi
 
-        # Generate manifest if requested
-        if [ -n "${{ inputs.save-manifest }}" ]; then
-          npx -y mcp-trustcard@latest scan "${{ inputs.server }}" --save-manifest "${{ inputs.save-manifest }}"
-          echo "Manifest saved to ${{ inputs.save-manifest }}"
+        # Generate manifest if requested — gen-manifest is the subcommand that
+        # writes manifests; `scan` has no --save-manifest flag.
+        if [ -n "$TRUSTCARD_SAVE_MANIFEST" ]; then
+          npx -y "$TRUSTCARD_PKG" gen-manifest "$TRUSTCARD_SERVER" --save-manifest "$TRUSTCARD_SAVE_MANIFEST"
+          echo "Manifest saved to $TRUSTCARD_SAVE_MANIFEST"
         fi
 
-        # Fail if below threshold
-        if [ "$score" -lt "${{ inputs.min-score }}" ]; then
-          echo "::error::MCP server ${{ inputs.server }} scored $score, below minimum ${{ inputs.min-score }}"
-          exit 1
+        # The scan's own exit code already encodes the threshold verdict —
+        # propagate it as the primary failure signal.
+        if [ "$scan_rc" -ne 0 ]; then
+          echo "::error::MCP server $TRUSTCARD_SERVER scored $score, below minimum $TRUSTCARD_MIN_SCORE (or a check FAILED)"
+          exit "$scan_rc"
         fi

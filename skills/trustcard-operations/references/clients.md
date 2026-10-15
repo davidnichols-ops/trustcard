@@ -33,7 +33,9 @@ Loopback is the default bind. Bind elsewhere only as a separately designed deplo
 
 Keep the same protocol/session route the client supports. Antigravity can point `serverUrl` at an existing gate. For Codex, inspect `codex mcp add --help` and `codex mcp list --json` and use its supported URL registration. Verify the persisted config, then reconnect the client. Do not claim a currently open chat reloaded its tool surface automatically.
 
-The fleet JSON inventory does not recognize HTTP URLs as verified gates. Report those routes separately using direct endpoint checks. Remote OAuth connectors must retain their existing authentication flow; do not interpose the current local gate as a generic OAuth proxy.
+`mcp-trustcard gate --config <file>` generates the manifest and previews (or with `--apply`, writes) the rewritten config entry: the URL points at the loopback `mcp-http-proxy` and an `_meta` marker records the manifest and upstream. Once applied, `status`, `renew` and `reapprove` treat the entry as gated — discovery runs against the recorded upstream, not the filtering proxy. Until `--apply` and the proxy process are both in place, the entry is ungated.
+
+Remote OAuth connectors must retain their existing authentication flow; do not interpose the current local gate as a generic OAuth proxy.
 
 ## Background services
 

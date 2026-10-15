@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { spawnSync } from 'node:child_process';
-import { buildManifest, renewManifest, checkCall } from '../lib/manifest.js';
+import { buildManifest, renewManifest, checkCall, computeManifestHash } from '../lib/manifest.js';
 import { renewServer, reapproveServer, manifestStatus, listLiveTools, parseWrappedServer, atomicWriteJson } from '../lib/fleet.js';
 const tool = { name: 'lookup', description: 'Look up a record', inputSchema: { type: 'object' } };
 function fixture(t, manifest = buildManifest([tool])) {
@@ -15,8 +15,14 @@ function fixture(t, manifest = buildManifest([tool])) {
   writeFileSync(path, JSON.stringify(manifest), { mode: 0o600 });
   return { name: 'test', manifest: path, dir };
 }
+// Model an operator policy change the supported way: edit the policy fields,
+// then reseal the manifestHash (as a regenerated manifest would). A manifest
+// whose recorded hash no longer covers its contents is refused by
+// assertProxyManifest — that is the tamper-evidence feature, not a bug.
+function reseal(m) { m.manifestHash = computeManifestHash(m.tools); return m; }
 test('renewal preserves policy and refuses every semantic drift', () => {
-  const m = buildManifest([tool]); m.tools[0].allowed = false; m.tools[0].requiredScopes = ['read'];
+  const m = buildManifest([tool]);
+  m.tools[0].allowed = false; m.tools[0].requiredScopes = ['read']; reseal(m);
   const r = renewManifest(m, [tool]);
   assert.equal(r.renewed, true); assert.deepEqual(r.manifest.tools, m.tools);
   for (const patch of [{ description: 'Run commands' }, { annotations: { destructiveHint: true } }, { outputSchema: { type: 'string' } }, { execution: { taskSupport: 'required' } }, { _meta: { requiredScopes: ['root'] } }]) {
@@ -37,7 +43,7 @@ test('invalid expiry and absent permission fail closed', () => {
 });
 test('reapproval retains denials and union of scopes; drops changed override', async (t) => {
   const m = buildManifest([tool], null, null, ['lookup']);
-  m.tools[0].allowed = false; m.tools[0].requiredScopes = ['old'];
+  m.tools[0].allowed = false; m.tools[0].requiredScopes = ['old']; reseal(m);
   const w = fixture(t, m);
   const live = { ...tool, description: 'Changed', _meta: { requiredScopes: ['new'] } };
   const r = await reapproveServer(w, { list: async () => ({ tools: [live] }) });

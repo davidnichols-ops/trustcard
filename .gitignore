@@ -10,3 +10,6 @@ data/mcp-registry-2026-07-27.json
 # Local discovery evidence and generated release archives
 .discovery/
 dist/
+
+# Demo audit logs — never commit generated append-only JSONL
+examples/bruce-lee/*.jsonl

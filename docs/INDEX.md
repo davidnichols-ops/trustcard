@@ -23,7 +23,7 @@ its purpose and audience.
 
 | Document | Why read it |
 |---|---|
-| [`BEHAVIOR.md`](BEHAVIOR.md) | Behavioral verification: sandbox semantics, probe categories, divergence classes, regression corpus, and CLI usage. |
+| [`BEHAVIOR.md`](BEHAVIOR.md) | Behavioral verification: process-harness semantics (not an OS sandbox), probe categories, divergence classes, regression corpus, and CLI usage. |
 | [`THREAT-MODEL.md`](THREAT-MODEL.md) | Attack scenarios and controls, including v2/v3 additions. |
 
 ## Operational

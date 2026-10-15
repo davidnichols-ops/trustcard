@@ -41,9 +41,10 @@ import { createServer, request } from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson } from "../lib/manifest.js";
+import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson, assertProxyManifest } from "../lib/manifest.js";
 import { atomicWriteJson } from "../lib/fleet.js";
 import { redact } from "../lib/redact.js";
+import { validateArgs } from "../lib/guard.js";
 import { DevIssuer, TokenValidator, extractToken, stripAuth } from "../lib/auth.js";
 import { SignedReceiptChain, makeReceiptSink, loadReceipts } from "../lib/receipts.js";
 import { hashJson } from "../lib/hash.js";
@@ -129,10 +130,14 @@ if (receiptKeyPath) {
   }
 }
 
-// Load manifest
+// Load manifest — and refuse to run on one that fails structural validation.
+// Manifest integrity is enforced before ANY mode flag (including --allow-all)
+// is honored: a malformed or signature-bearing manifest is not a valid
+// enforcement policy and must fail closed.
 let manifest;
 try {
   manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  assertProxyManifest(manifest);
 } catch (e) {
   console.error(`mcp-http-proxy: failed to load manifest: ${e.message}`);
   process.exit(2);
@@ -140,6 +145,9 @@ try {
 
 let approvedNames = new Set(manifest.tools.map((t) => t.name));
 let driftedNames = new Set();
+// tool name -> live inputSchema, captured from the latest tools/list. Used to
+// validate call arguments for legacy manifests that predate embedded schemas.
+const liveSchemas = new Map();
 
 // Parse upstream URL
 const upstream = new URL(upstreamUrl);
@@ -223,6 +231,15 @@ async function handleRequest(req, res) {
   // Intercept tools/call — block unapproved tools + enforce auth scopes
   let authToken = null;
   let callManifest = null;
+  // A tools/call notification (no id) can never be authorized — the gate has
+  // no response channel, but the side effect would still execute upstream.
+  // Reject it: only id-carrying tools/call requests are enforceable.
+  if (rpcMsg.method === "tools/call" && rpcMsg.id == null) {
+    log("DROP: tools/call notification — calls must carry a request id to pass the gate");
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end();
+    return;
+  }
   if (rpcMsg.method === "tools/call" && rpcMsg.id != null) {
     const toolName = rpcMsg.params?.name;
 
@@ -258,13 +275,13 @@ async function handleRequest(req, res) {
     }
 
     // checkCall validates manifest membership, danger flag, and scope requirements.
-    // In --allow-all mode, skip the check but still log dangerous calls.
+    // --allow-all narrows per-tool admission (unknown/dangerous tools pass)
+    // but can never bypass manifest validity, expiry, or requiredScopes —
+    // those are enforced inside checkCall regardless of mode.
     callManifest = manifest;
-    const check = allowAll
-      ? { allowed: true, reason: null }
-      : driftedNames.has(toolName)
-        ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
-        : checkCall(manifest, toolName, rpcMsg.params?.arguments ?? {}, authToken);
+    const check = driftedNames.has(toolName) && !allowAll
+      ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
+      : checkCall(manifest, toolName, rpcMsg.params?.arguments ?? {}, authToken, { allowAll });
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -279,6 +296,25 @@ async function handleRequest(req, res) {
       const entry = (callManifest ?? manifest).tools.find((t) => t.name === toolName);
       if (entry?.allowed === false) {
         log(`ALLOW-ALL: dangerous tool "${toolName}" called (score=${entry.dangerScore}, confidence=${entry.dangerConfidence}) — forwarded`);
+      }
+    }
+
+    // Gate 2 arg enforcement: validate call arguments against the *approved*
+    // inputSchema (embedded in the manifest; for legacy manifests, the schema
+    // observed in the latest tools/list) before forwarding upstream.
+    const callEntry = (callManifest ?? manifest).tools.find((t) => t.name === toolName);
+    const schema = callEntry?.inputSchema ?? liveSchemas.get(toolName);
+    if (schema) {
+      const problem = validateArgs(schema, rpcMsg.params?.arguments ?? {});
+      if (problem) {
+        log(`BLOCKED tools/call: arguments violate approved inputSchema (${problem})`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: rpcMsg.id,
+          error: { code: -32602, message: `mcp-http-proxy: ${problem}` },
+        }));
+        return;
       }
     }
   }
@@ -326,7 +362,13 @@ async function handleRequest(req, res) {
     const decoder = new TextDecoder();
     let sseBuffer = "";
     let collectedData = "";
-    let isToolsList = rpcMsg.method === "tools/list" && rpcMsg.id != null;
+    const isToolsList = rpcMsg.method === "tools/list" && rpcMsg.id != null;
+    // Response-id discipline: this POST opened exactly one pending request
+    // (rpcMsg.id). The FIRST upstream response carrying that id consumes it;
+    // forged ids, duplicates, and late same-id responses are dropped and
+    // never reach the client. Notifications (no id) and server→client
+    // requests (id + method) are not responses and pass through.
+    let responded = false;
 
     try {
       while (true) {
@@ -353,13 +395,30 @@ async function handleRequest(req, res) {
           }
           const dataStr = dataLines.join("\n");
 
+          // Response-id enforcement: a JSON-RPC response (id, no method) must
+          // match the single pending request id, exactly once.
+          if (dataStr && rpcMsg.id != null) {
+            let parsed = null;
+            try { parsed = JSON.parse(dataStr); } catch { /* not JSON — pass through */ }
+            if (parsed && parsed.id != null && parsed.method == null) {
+              if (responded || parsed.id !== rpcMsg.id) {
+                log(`DROP: upstream ${responded ? "duplicate/late" : "non-pending"} response id=${JSON.stringify(parsed.id)}`);
+                continue;
+              }
+              responded = true;
+            }
+          }
+
           // Try to parse as JSON-RPC
           if (isToolsList && dataStr) {
             try {
               const msg = JSON.parse(dataStr);
-              if (msg.id != null && msg.result?.tools) {
+              if (msg.id === rpcMsg.id && msg.result?.tools) {
                 // This is the tools/list response — intercept it
                 const liveTools = msg.result.tools || [];
+                for (const t of liveTools) {
+                  if (t && typeof t.name === "string") liveSchemas.set(t.name, t.inputSchema);
+                }
                 const diff = diffManifest(manifest, liveTools);
       driftedNames = new Set(diff.drifted.map((t) => t.name));
 
@@ -487,9 +546,27 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // Intercept tools/list response
+    // Response-id discipline: this POST opened exactly one pending request
+    // (rpcMsg.id). An upstream response carrying a different id is forged or
+    // desynchronized — drop it and return an error bound to the REQUEST id,
+    // so a forged result can never reach the client.
+    if (rpcMsg.id != null && responseMsg.id !== rpcMsg.id) {
+      log(`DROP: upstream response id=${JSON.stringify(responseMsg.id)} does not match pending request id=${JSON.stringify(rpcMsg.id)}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpcMsg.id,
+        error: { code: -32603, message: "mcp-http-proxy: upstream response id mismatch — response dropped" },
+      }));
+      return;
+    }
+
+    // Intercept tools/list response (id match already enforced above)
     if (rpcMsg.method === "tools/list" && rpcMsg.id != null && responseMsg.result?.tools) {
       const liveTools = responseMsg.result.tools || [];
+      for (const t of liveTools) {
+        if (t && typeof t.name === "string") liveSchemas.set(t.name, t.inputSchema);
+      }
       const diff = diffManifest(manifest, liveTools);
       driftedNames = new Set(diff.drifted.map((t) => t.name));
 
