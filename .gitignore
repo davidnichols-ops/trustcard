@@ -6,3 +6,7 @@ reports/
 data/mcp-ecosystem-2026-07-27-full.json
 data/mcp-registry-2026-07-27.json
 .nonstop/
+
+# Local discovery evidence and generated release archives
+.discovery/
+dist/

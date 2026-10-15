@@ -608,3 +608,7 @@ trustcard combines all of them.
 ## License
 
 MIT
+
+## Operations release candidate
+
+The local 3.2.0-rc.1 candidate adds a reusable MCP governance skill, config-bound operations MCP, fleet renewal/reapproval and a local tool-access console. See [operations and deployment limits](docs/OPERATIONS.md). These features require the candidate package; they are not assumed to exist in the published 3.1.0 release.

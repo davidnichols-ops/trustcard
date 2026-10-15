@@ -2,8 +2,10 @@
 // mcp-http-proxy — HTTP/SSE proxy that enforces an approved tool manifest at call time.
 //
 // Usage:
-//   mcp-http-proxy --manifest <file> --upstream <url> [--port <port>] [--strict] [--auto-update]
+//   mcp-http-proxy --manifest <file> --upstream <url> [--port <port>] [--strict] [--auto-update] [--allow-all]
 //   mcp-http-proxy --manifest <file> --upstream https://mcp.notion.com/mcp --port 9876
+//   mcp-http-proxy --manifest <file> --upstream <url> --auth-secret <hex>   # enable per-agent token validation
+//   mcp-http-proxy --manifest <file> --upstream <url> --receipt-key <file>  # enable signed receipts
 //
 // The proxy listens on a local port and forwards HTTP requests to the upstream
 // MCP server, intercepting tools/list and tools/call just like the stdio proxy.
@@ -12,6 +14,22 @@
 //   default      — logs drift to stderr, strips unapproved tools silently
 //   --strict     — exits with error on any drift (added, removed, or schema change)
 //   --auto-update — updates the manifest file on disk when new tools are detected
+//   --allow-all  — passes all tools through without filtering (including dangerous
+//                   ones). Still logs drift and dangerous-tool calls for audit.
+//                   Use only when you trust the upstream server.
+//
+// Auth (--auth-secret <hex>):
+//   When set, the proxy validates per-agent HMAC-SHA256 tokens on every tools/call.
+//   Tokens are extracted from the Authorization: Bearer <token> HTTP header or
+//   from _meta.auth.token in the MCP request body. Tools with requiredScopes in
+//   the manifest require a valid token with sufficient scopes. Unscoped tools
+//   pass without a token.
+//
+// Receipts (--receipt-key <file>):
+//   When set, the proxy loads an Ed25519 keypair and emits signed, hash-chained
+//   receipts for every tools/call. Receipts are appended to --receipt-dir (or
+//   the default path). Each receipt contains: tool name, args digest, timestamp,
+//   result digest, and an Ed25519 signature chained to the previous receipt.
 //
 // The proxy handles both:
 //   - HTTP POST requests (JSON-RPC over HTTP)
@@ -20,15 +38,22 @@
 // For SSE, the proxy buffers the stream, parses JSON-RPC messages, intercepts
 // tools/list and tools/call responses, and re-emits the SSE stream.
 import { createServer, request } from "node:http";
-import { readFileSync, writeFileSync } from "node:fs";
-import { buildManifest, diffManifest, checkCall } from "../lib/manifest.js";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson } from "../lib/manifest.js";
+import { atomicWriteJson } from "../lib/fleet.js";
 import { redact } from "../lib/redact.js";
+import { DevIssuer, TokenValidator, extractToken, stripAuth } from "../lib/auth.js";
+import { SignedReceiptChain, makeReceiptSink, loadReceipts } from "../lib/receipts.js";
+import { hashJson } from "../lib/hash.js";
 
 const args = process.argv.slice(2);
 
 // Parse flags
 const strictMode = args.includes("--strict");
 const autoUpdate = args.includes("--auto-update");
+const allowAll = args.includes("--allow-all");
 
 const manifestIdx = args.indexOf("--manifest");
 if (manifestIdx === -1 || !args[manifestIdx + 1]) {
@@ -48,6 +73,62 @@ const upstreamUrl = args[upstreamIdx + 1];
 const portIdx = args.indexOf("--port");
 const port = portIdx !== -1 && args[portIdx + 1] ? parseInt(args[portIdx + 1], 10) : 9876;
 
+// Parse --auth-secret <hex>: enables per-agent token validation.
+// Also supports --auth-secret-file <path> to read the secret from a file
+// (useful for launchd/daemon configs where putting the secret in the
+// command line would expose it in process listings).
+const authSecretIdx = args.indexOf("--auth-secret");
+const authSecretFileIdx = args.indexOf("--auth-secret-file");
+let authSecret = authSecretIdx !== -1 && args[authSecretIdx + 1] ? args[authSecretIdx + 1] : null;
+if (!authSecret && authSecretFileIdx !== -1 && args[authSecretFileIdx + 1]) {
+  try {
+    authSecret = readFileSync(args[authSecretFileIdx + 1], "utf8").trim();
+  } catch (e) {
+    console.error(`mcp-http-proxy: failed to read auth secret file: ${e.message}`);
+    process.exit(2);
+  }
+}
+
+// Parse --receipt-key <file>: enables signed, chained receipts.
+const receiptKeyIdx = args.indexOf("--receipt-key");
+const receiptKeyPath = receiptKeyIdx !== -1 && args[receiptKeyIdx + 1] ? args[receiptKeyIdx + 1] : null;
+
+// Parse --receipt-dir <dir>: where to store receipt chain files.
+const receiptDirIdx = args.indexOf("--receipt-dir");
+const receiptDir = receiptDirIdx !== -1 && args[receiptDirIdx + 1]
+  ? args[receiptDirIdx + 1]
+  : join(homedir(), ".local", "share", "maos-mcp", "receipts");
+
+// Set up token validator if auth-secret is provided.
+let tokenValidator = null;
+if (authSecret) {
+  const devIssuer = new DevIssuer({ secret: authSecret });
+  tokenValidator = new TokenValidator({ devIssuer });
+  log("Auth enabled: per-agent token validation with HMAC-SHA256");
+}
+
+// Set up signed receipt chain if receipt-key is provided.
+let receiptChain = null;
+let receiptSink = null;
+if (receiptKeyPath) {
+  try {
+    const keyDoc = JSON.parse(readFileSync(receiptKeyPath, "utf8"));
+    if (!keyDoc.privateKey) {
+      console.error("mcp-http-proxy: receipt key file missing privateKey field");
+      process.exit(2);
+    }
+    // Ensure receipt directory exists
+    if (!existsSync(receiptDir)) mkdirSync(receiptDir, { recursive: true });
+    const receiptFile = join(receiptDir, "receipts.ndjson");
+    receiptChain = new SignedReceiptChain({ privateKey: keyDoc.privateKey, receipts: loadReceipts(receiptFile) });
+    receiptSink = makeReceiptSink(receiptFile);
+    log(`Receipts enabled: signed chain → ${receiptFile} (keyId: ${receiptChain.keyId})`);
+  } catch (e) {
+    console.error(`mcp-http-proxy: failed to load receipt key: ${e.message}`);
+    process.exit(2);
+  }
+}
+
 // Load manifest
 let manifest;
 try {
@@ -58,6 +139,7 @@ try {
 }
 
 let approvedNames = new Set(manifest.tools.map((t) => t.name));
+let driftedNames = new Set();
 
 // Parse upstream URL
 const upstream = new URL(upstreamUrl);
@@ -138,10 +220,51 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // Intercept tools/call — block unapproved tools
+  // Intercept tools/call — block unapproved tools + enforce auth scopes
+  let authToken = null;
+  let callManifest = null;
   if (rpcMsg.method === "tools/call" && rpcMsg.id != null) {
     const toolName = rpcMsg.params?.name;
-    const check = checkCall(manifest, toolName);
+
+    // Extract and validate auth token if auth-secret is configured.
+    if (tokenValidator) {
+      // Check Authorization: Bearer <token> HTTP header first, then _meta.auth.token
+      const authHeader = req.headers["authorization"];
+      let rawToken = null;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        rawToken = authHeader.slice(7);
+      } else {
+        rawToken = extractToken(rpcMsg);
+      }
+      if (rawToken) {
+        authToken = await tokenValidator.validate(rawToken);
+        if (!authToken || !authToken.isValid) {
+          const reason = !authToken
+            ? "invalid auth token (signature verification failed)"
+            : authToken.isExpired
+              ? `auth token expired at ${authToken.expiresAt}`
+              : "auth token is inactive";
+          log(`BLOCKED tools/call: ${reason}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpcMsg.id,
+            error: { code: -32600, message: `mcp-http-proxy: ${reason}` },
+          }));
+          return;
+        }
+        log(`Auth: agent "${authToken.subject}" scopes=[${authToken.scopes.join(", ")}]`);
+      }
+    }
+
+    // checkCall validates manifest membership, danger flag, and scope requirements.
+    // In --allow-all mode, skip the check but still log dangerous calls.
+    callManifest = manifest;
+    const check = allowAll
+      ? { allowed: true, reason: null }
+      : driftedNames.has(toolName)
+        ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
+        : checkCall(manifest, toolName, rpcMsg.params?.arguments ?? {}, authToken);
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -152,6 +275,20 @@ async function handleRequest(req, res) {
       }));
       return;
     }
+    if (allowAll) {
+      const entry = (callManifest ?? manifest).tools.find((t) => t.name === toolName);
+      if (entry?.allowed === false) {
+        log(`ALLOW-ALL: dangerous tool "${toolName}" called (score=${entry.dangerScore}, confidence=${entry.dangerConfidence}) — forwarded`);
+      }
+    }
+  }
+
+  // Strip auth metadata from the request before forwarding to upstream.
+  // The upstream MCP server should not see trustcard-internal auth fields.
+  let forwardBody = bodyStr;
+  if (authToken && rpcMsg.params?._meta) {
+    const cleaned = stripAuth(rpcMsg);
+    forwardBody = JSON.stringify(cleaned);
   }
 
   // Forward to upstream
@@ -165,7 +302,7 @@ async function handleRequest(req, res) {
   const upstreamReq = await fetch(`${upstream.origin}${upstreamPath}`, {
     method: "POST",
     headers: fwdHeaders,
-    body: bodyStr,
+    body: forwardBody,
   });
 
   // Check if response is SSE
@@ -224,6 +361,7 @@ async function handleRequest(req, res) {
                 // This is the tools/list response — intercept it
                 const liveTools = msg.result.tools || [];
                 const diff = diffManifest(manifest, liveTools);
+      driftedNames = new Set(diff.drifted.map((t) => t.name));
 
                 if (diff.added.length > 0) {
                   log(`DRIFT: ${diff.added.length} new tool(s): ${diff.added.join(", ")}`);
@@ -256,20 +394,33 @@ async function handleRequest(req, res) {
                 }
 
                 if (autoUpdate && diff.added.length > 0) {
-                  const newManifest = buildManifest(liveTools, manifest.serverInfo, manifest.spec);
+                  const newManifest = preserveProxyPolicy(manifest, buildManifest(liveTools, manifest.serverInfo, manifest.spec));
                   try {
-                    writeFileSync(manifestPath, JSON.stringify(newManifest, null, 2));
+                    const original = readFileSync(manifestPath, "utf8");
+          if (canonicalJson(JSON.parse(original)) !== canonicalJson(manifest)) throw new Error("manifest changed on disk; reload policy before auto-update");
+          atomicWriteJson(manifestPath, newManifest, { expected: original });
                     manifest = newManifest;
+                    driftedNames.clear();
                     approvedNames = new Set(newManifest.tools.map((t) => t.name));
                     log(`AUTO-UPDATE: manifest updated — ${diff.added.length} new tool(s) approved`);
                   } catch (e) {
                     log(`AUTO-UPDATE FAILED: ${e.message}`);
                   }
-                  // In auto-update, pass through unmodified
+                  const approved = liveTools.filter((t) => manifest.tools.find((m) => m.name === t.name)?.allowed === true && !driftedNames.has(t.name));
+                  res.write(`event: ${eventType}\ndata: ${JSON.stringify({ ...msg, result: { ...msg.result, tools: approved } })}\n\n`);
+                } else if (allowAll) {
+                  // --allow-all: pass all tools through without filtering
+                  const dangerousCount = liveTools.filter((t) => {
+                    const entry = manifest.tools.find((m) => m.name === t.name);
+                    return entry?.allowed === false;
+                  }).length;
+                  if (dangerousCount > 0) {
+                    log(`ALLOW-ALL: passing through ${dangerousCount} dangerous tool(s) unfiltered`);
+                  }
                   res.write(`event: ${eventType}\ndata: ${dataStr}\n\n`);
                 } else {
                   // Default: strip unapproved tools
-                  const filteredTools = liveTools.filter((t) => approvedNames.has(t.name));
+                  const filteredTools = liveTools.filter((t) => approvedNames.has(t.name) && !driftedNames.has(t.name) && manifest.tools.find((m) => m.name === t.name)?.allowed === true);
                   if (filteredTools.length !== liveTools.length) {
                     log(`Filtered ${liveTools.length - filteredTools.length} unapproved tool(s)`);
                   }
@@ -284,6 +435,38 @@ async function handleRequest(req, res) {
           }
 
           // Pass through the event
+          // For tools/call responses over SSE, emit a receipt if configured.
+          if (rpcMsg.method === "tools/call" && rpcMsg.id != null && receiptChain && dataStr) {
+            try {
+              const msg = JSON.parse(dataStr);
+              if (msg.id != null && msg.result && !msg.error) {
+                const toolName = rpcMsg.params?.name;
+                const toolArgs = rpcMsg.params?.arguments ?? {};
+                const entry = (callManifest ?? manifest).tools.find((t) => t.name === toolName);
+                const receipt = receiptChain.append({
+                  schema: "trustcard.dev/receipt@1",
+                  at: new Date().toISOString(),
+                  server: manifest.serverInfo?.name ?? manifest.spec ?? null,
+                  tool: toolName,
+                  toolDigest: entry?.schemaHash ?? null,
+                  toolsetDigest: callManifest.tools.every((t) => t.contractDigest) ? hashJson({ toolset: callManifest.tools.map((t) => t.contractDigest).sort() }) : null,
+                  policyDigest: hashJson(callManifest),
+                  serverDigest: null,
+                  protocolVersion: null,
+                  argumentsDigest: hashJson(toolArgs),
+                  resultDigest: msg.result !== undefined ? hashJson(msg.result) : null,
+                  annotations: null,
+                  capabilityDigest: entry?.contractDigest ?? null,
+                  relyingParty: authToken?.subject ?? null,
+                  environment: null,
+                });
+                receiptSink?.(receipt);
+                log(`Receipt #${receipt.seq}: ${receipt.receiptDigest?.slice(0, 16) ?? "?"}`);
+              }
+            } catch {
+              // Not JSON or parse error — still pass through
+            }
+          }
           res.write(`event: ${eventType}\ndata: ${dataStr}\n\n`);
         }
       }
@@ -308,6 +491,7 @@ async function handleRequest(req, res) {
     if (rpcMsg.method === "tools/list" && rpcMsg.id != null && responseMsg.result?.tools) {
       const liveTools = responseMsg.result.tools || [];
       const diff = diffManifest(manifest, liveTools);
+      driftedNames = new Set(diff.drifted.map((t) => t.name));
 
       if (diff.added.length > 0) log(`DRIFT: ${diff.added.length} new tool(s): ${diff.added.join(", ")}`);
       if (diff.removed.length > 0) log(`DRIFT: ${diff.removed.length} removed: ${diff.removed.join(", ")}`);
@@ -331,18 +515,30 @@ async function handleRequest(req, res) {
       }
 
       if (autoUpdate && diff.added.length > 0) {
-        const newManifest = buildManifest(liveTools, manifest.serverInfo, manifest.spec);
+        const newManifest = preserveProxyPolicy(manifest, buildManifest(liveTools, manifest.serverInfo, manifest.spec));
         try {
-          writeFileSync(manifestPath, JSON.stringify(newManifest, null, 2));
+          const original = readFileSync(manifestPath, "utf8");
+          if (canonicalJson(JSON.parse(original)) !== canonicalJson(manifest)) throw new Error("manifest changed on disk; reload policy before auto-update");
+          atomicWriteJson(manifestPath, newManifest, { expected: original });
           manifest = newManifest;
+                    driftedNames.clear();
           approvedNames = new Set(newManifest.tools.map((t) => t.name));
           log(`AUTO-UPDATE: manifest updated — ${diff.added.length} new tool(s) approved`);
         } catch (e) {
           log(`AUTO-UPDATE FAILED: ${e.message}`);
         }
+      } else if (allowAll) {
+        // --allow-all: pass all tools through without filtering
+        const dangerousCount = liveTools.filter((t) => {
+          const entry = manifest.tools.find((m) => m.name === t.name);
+          return entry?.allowed === false;
+        }).length;
+        if (dangerousCount > 0) {
+          log(`ALLOW-ALL: passing through ${dangerousCount} dangerous tool(s) unfiltered`);
+        }
       } else {
         // Default: strip unapproved tools
-        const filteredTools = liveTools.filter((t) => approvedNames.has(t.name));
+        const filteredTools = liveTools.filter((t) => approvedNames.has(t.name) && !driftedNames.has(t.name) && manifest.tools.find((m) => m.name === t.name)?.allowed === true);
         if (filteredTools.length !== liveTools.length) {
           log(`Filtered ${liveTools.length - filteredTools.length} unapproved tool(s)`);
         }
@@ -350,9 +546,43 @@ async function handleRequest(req, res) {
       }
     }
 
-    // Log allowed calls
+    if (rpcMsg.method === "tools/list" && responseMsg.result?.tools && !allowAll) {
+      responseMsg.result.tools = responseMsg.result.tools.filter((t) => manifest.tools.find((m) => m.name === t.name)?.allowed === true && !driftedNames.has(t.name));
+    }
+
+    // Log allowed calls + emit signed receipts
     if (rpcMsg.method === "tools/call" && rpcMsg.id != null && !responseMsg.error) {
       log(`ALLOWED tools/call: ${rpcMsg.params?.name}`);
+      // Emit a signed, chained receipt if receipt chain is configured.
+      if (receiptChain) {
+        try {
+          const toolName = rpcMsg.params?.name;
+          const toolArgs = rpcMsg.params?.arguments ?? {};
+          const result = responseMsg.result;
+          const entry = (callManifest ?? manifest).tools.find((t) => t.name === toolName);
+          const receipt = receiptChain.append({
+            schema: "trustcard.dev/receipt@1",
+            at: new Date().toISOString(),
+            server: manifest.serverInfo?.name ?? manifest.spec ?? null,
+            tool: toolName,
+            toolDigest: entry?.schemaHash ?? null,
+            toolsetDigest: callManifest.tools.every((t) => t.contractDigest) ? hashJson({ toolset: callManifest.tools.map((t) => t.contractDigest).sort() }) : null,
+                  policyDigest: hashJson(callManifest),
+            serverDigest: null,
+            protocolVersion: null,
+            argumentsDigest: hashJson(toolArgs),
+            resultDigest: result !== undefined ? hashJson(result) : null,
+            annotations: null,
+            capabilityDigest: entry?.contractDigest ?? null,
+            relyingParty: authToken?.subject ?? null,
+            environment: null,
+          });
+          receiptSink?.(receipt);
+          log(`Receipt #${receipt.seq}: ${receipt.receiptDigest?.slice(0, 16) ?? "?"}`);
+        } catch (e) {
+          log(`Receipt error: ${redact(e.message)}`);
+        }
+      }
     }
 
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -365,7 +595,13 @@ const server = createServer(async (req, res) => {
   // Health check endpoint
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", tools: manifest.tools.length, mode: strictMode ? "strict" : autoUpdate ? "auto-update" : "default" }));
+    res.end(JSON.stringify({
+      status: "ok",
+      tools: manifest.tools.length,
+      mode: strictMode ? "strict" : autoUpdate ? "auto-update" : allowAll ? "allow-all" : "default",
+      auth: authSecret ? "enabled" : "disabled",
+      receipts: receiptKeyPath ? "enabled" : "disabled",
+    }));
     return;
   }
 
@@ -394,10 +630,14 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => {
+const hostIdx = args.indexOf("--host");
+const host = hostIdx !== -1 ? args[hostIdx + 1] : "127.0.0.1";
+server.listen(port, host, () => {
   const actualPort = server.address().port;
-  const modeLabel = strictMode ? "strict" : autoUpdate ? "auto-update" : "default";
-  log(`HTTP proxy started on port ${actualPort} — mode: ${modeLabel}, manifest: ${manifest.tools.length} tools, upstream: ${redact(upstreamUrl)}`);
+  const modeLabel = strictMode ? "strict" : autoUpdate ? "auto-update" : allowAll ? "allow-all" : "default";
+  const authLabel = authSecret ? "auth: ON" : "auth: off";
+  const receiptLabel = receiptKeyPath ? "receipts: ON" : "receipts: off";
+  log(`HTTP proxy started on port ${actualPort} — mode: ${modeLabel}, ${authLabel}, ${receiptLabel}, manifest: ${manifest.tools.length} tools, upstream: ${redact(upstreamUrl)}`);
   log(`  Health check: http://localhost:${actualPort}/health`);
   log(`  Configure your MCP client to use: http://localhost:${actualPort}`);
 });

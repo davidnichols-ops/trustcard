@@ -28,6 +28,8 @@ its purpose and audience.
 
 ## Operational
 
+- [Operations release candidate](OPERATIONS.md): fleet commands, local console, reusable skill and explicit deployment limits.
+
 | Document | Why read it |
 |---|---|
 | [`MIGRATION.md`](MIGRATION.md) | Moving from v0.x → v3, v1 → v3, and v2 → v3. |
