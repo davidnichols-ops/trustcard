@@ -32,19 +32,32 @@ mcp-trustcard scan https://api.example.com/mcp
 
 Output: a scorecard with handshake, tools, security checks, and a trust score.
 
-## 3. Generate a manifest and pin (1 minute)
+## 3. Record provenance and pin (1 minute)
 
-Create a cryptographic manifest that records the server's identity:
+trustcard has two different manifest types — they are not interchangeable:
+
+- **Provenance manifest** (`manifest`) — a signed statement of "what this
+  server was at a point in time": tool definitions, protocol, publisher
+  identity, digests. Produced by `mcp-trustcard manifest`, then `sign`.
+- **Proxy-enforcement manifest** (`gen-manifest`) — the allow/deny policy a
+  proxy enforces at call time. Unsigned by design.
+
+Create provenance first:
 
 ```bash
-# Generate a publisher keypair
+# Generate a publisher keypair (keep the private key private)
 mcp-trustcard keygen --out my-key.json
 
-# Create a manifest for a server
-mcp-trustcard gen-manifest @modelcontextprotocol/server-filesystem --save-manifest server.json
+# Create an UNSIGNED provenance manifest, embedding your public publisher
+# identity (--key embeds identity; it does not sign)
+mcp-trustcard manifest @modelcontextprotocol/server-filesystem \
+  --key my-key.json --out server-manifest.json
 
-# Sign it
-mcp-trustcard sign server.json --key my-key.json --out server-signed.json
+# Sign it — the private key signs, producing a verified provenance record
+mcp-trustcard sign server-manifest.json --key my-key.json --out server-signed.json
+
+# Verify it
+mcp-trustcard verify server-signed.json
 
 # Pin it (TOFU — trust on first use)
 mcp-trustcard pin @modelcontextprotocol/server-filesystem
@@ -53,17 +66,24 @@ mcp-trustcard pin @modelcontextprotocol/server-filesystem
 mcp-trustcard pins
 ```
 
+Provenance manifests expire after 90 days by default (`--expires-in` or
+`--no-expiry`); an expired signed manifest fails `verify`.
+
 ## 4. Run a proxy with enforcement (1 minute)
 
-The proxy enforces the manifest — dangerous tools are stripped, calls are
-validated against the signed capability descriptor:
+The enforcement proxies consume the **proxy manifest** from `gen-manifest`,
+not the signed provenance manifest:
 
 ```bash
-# stdio server
-mcp-trustcard manifest --manifest server-signed.json -- npx -y @modelcontextprotocol/server-filesystem
+# Generate a proxy manifest (allow/deny policy + contract digests)
+mcp-trustcard gen-manifest @modelcontextprotocol/server-filesystem \
+  --save-manifest policy.json
 
-# HTTP server
-mcp-http-proxy --manifest server-signed.json --upstream https://api.example.com/mcp --port 8080
+# stdio server — the proxy sits between your client and the server
+mcp-proxy --manifest policy.json -- npx -y @modelcontextprotocol/server-filesystem
+
+# HTTP server — a local forward proxy enforces the same policy
+mcp-http-proxy --manifest policy.json --upstream https://api.example.com/mcp --port 8080
 ```
 
 ## 5. Emit and query evidence (1 minute)

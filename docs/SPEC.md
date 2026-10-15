@@ -511,9 +511,10 @@ The v3 extensions are **additive**. They do not change `toolDigest`,
 
 ### 14.1 Behavioral verification
 
-`lib/behavior.js` executes a server in a sandboxed stdio harness, fires
-deterministic seeded probes, and compares observations to a
-`ReferenceObservation` or baseline expectations.
+`lib/behavior.js` executes a server as a process-isolated stdio child (fresh
+cwd, minimal environment — no OS-level sandboxing), fires deterministic seeded
+probes, and compares observations to a `ReferenceObservation` or baseline
+expectations.
 
 - `SandboxRuntime` is a **process harness**, not an OS sandbox. It sets a fresh
   `cwd`, limits environment variables, captures stdout/stderr, enforces timeouts,

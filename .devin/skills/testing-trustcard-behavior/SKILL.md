@@ -76,7 +76,7 @@ If any PIDs are listed, `kill -9` them and report it as a cleanup bug.
 
 ## What success looks like
 
-- `npm test` exits 0 with `# pass` matching the expected test count (currently 529).
+- `npm test` exits 0 with `# pass` matching the expected test count (currently 626).
 - Benign fixture: exit 0, `Summary: pass`, no high/critical findings.
 - Evil fixture: exit 1, `Summary: fail`, exactly the four high-severity classes above.
 - Diff: toolset digest match, four added findings.

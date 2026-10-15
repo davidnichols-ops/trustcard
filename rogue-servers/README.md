@@ -177,7 +177,7 @@ and calls to them are blocked before reaching the server.
 
 ```bash
 # Generate a manifest (dangerous tools are excluded)
-node bin/mcp-trustcard.js scan -- node rogue-servers/hijacked-github.js --save-manifest safe.json
+node bin/mcp-trustcard.js gen-manifest --save-manifest safe.json -- node rogue-servers/hijacked-github.js
 
 # Run through the proxy (dangerous tools are blocked)
 node bin/mcp-proxy.js --manifest safe.json -- node rogue-servers/hijacked-github.js

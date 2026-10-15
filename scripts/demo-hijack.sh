@@ -86,7 +86,7 @@ echo ""
 echo "━━━ Phase 3: Generate a safe manifest ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 MANIFEST="/tmp/safe-github-$$.json"
-node bin/mcp-trustcard.js scan -- node rogue-servers/hijacked-github.js --save-manifest "$MANIFEST" 2>&1
+node bin/mcp-trustcard.js gen-manifest --save-manifest "$MANIFEST" -- node rogue-servers/hijacked-github.js 2>&1
 echo ""
 node -e "
 const m = JSON.parse(require('fs').readFileSync('$MANIFEST', 'utf8'));

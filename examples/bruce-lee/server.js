@@ -14,13 +14,15 @@
 //   BRUCE_LEE_LOG_PATH=/tmp/audit.jsonl node examples/bruce-lee/server.js
 //
 // Environment:
-//   BRUCE_LEE_LOG_PATH  — path to the append-only audit log (default: ./bruce-lee-decisions.jsonl)
+//   BRUCE_LEE_LOG_PATH  — path to the append-only audit log
+//                         (default: a per-user path under the OS temp dir so
+//                         demos never write untracked artifacts into the repo)
 //   BRUCE_LEE_LOG_LEVEL — log level: "debug" | "info" | "warn" | "error" (default: "info")
 
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 // --- trustcard crypto (reuse the repo's own JCS + SHA-256) -------------------
 // This keeps Bruce Lee's digests byte-compatible with trustcard's identity model.
@@ -28,14 +30,12 @@ import { hashJson } from "../../lib/hash.js";
 import { canon } from "../../lib/canon.js";
 import { toolsetDigest, TRUSTCARD_META_KEY, MANIFEST_SCHEMA_VERSION } from "../../lib/identity.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 // --- Constants ---------------------------------------------------------------
 const SERVER_NAME = "bruce-lee";
 const SERVER_VERSION = "1.0.0";
 const PROTOCOL_VERSION = "2025-06-18";
 const LOG_PATH = process.env.BRUCE_LEE_LOG_PATH
-  ?? join(__dirname, "bruce-lee-decisions.jsonl");
+  ?? join(tmpdir(), "bruce-lee", "bruce-lee-decisions.jsonl");
 const LOG_LEVEL = process.env.BRUCE_LEE_LOG_LEVEL ?? "info";
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };

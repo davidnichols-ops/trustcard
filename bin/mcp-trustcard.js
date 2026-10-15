@@ -14,14 +14,14 @@
 //   unpin       remove a server pin
 //   pins        list the pin store
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { exec as execCb } from "node:child_process";
-import { promisify } from "node:util";
 import { runHealthcheck, scanConfigForSecrets } from "../lib/checks.js";
-import { buildManifest as buildProxyManifest } from "../lib/manifest.js";
+import { buildManifest as buildProxyManifest, manifestHashStatus } from "../lib/manifest.js";
 import { McpStdioClient, PROTOCOL_VERSIONS } from "../lib/client.js";
 import { fingerprint } from "../lib/fingerprint.js";
 import { observeServer } from "../lib/observe.js";
-import { buildManifest, signManifest, verifyManifest, generatePublisherKeypair, bindingConsistency } from "../lib/provenance.js";
+import { buildManifest, signManifest, verifyManifest, generatePublisherKeypair, bindingConsistency, isProxyManifest, normalizeTrustedKey, publisherFromSecret } from "../lib/provenance.js";
+import { hashManifestPayload } from "../lib/hash.js";
+import { MANIFEST_SCHEMA_VERSION, toolsetDigest, serverDigest } from "../lib/identity.js";
 import { buildDescriptor, signDescriptor, verifyDescriptor } from "../lib/descriptor.js";
 import { changeVector } from "../lib/change.js";
 import { diffToolsets, CHANGE_LEVEL } from "../lib/diff.js";
@@ -30,9 +30,10 @@ import { printFingerprint, printDiff } from "../lib/report.js";
 import { EvidenceStore } from "../lib/evidence-store.js";
 import { EVIDENCE_LAYERS } from "../lib/evidence-predicates.js";
 import { BehaviorEngine, SandboxRuntime, InputGenerator, OutputComparator, RegressionCorpus, ReferenceObservation } from "../lib/behavior.js";
-import { resolve as resolvePath, dirname, isAbsolute, basename } from "node:path";
-
-const exec = promisify(execCb);
+import { resolve as resolvePath, dirname, isAbsolute, basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { npmView, isNpmSpec, assertNpmSpec } from "../lib/npm.js";
+import { TRUSTCARD_VERSION } from "../lib/version.js";
 
 const argv = process.argv.slice(2);
 const noColor = argv.includes("--no-color") || !process.stdout.isTTY;
@@ -49,8 +50,16 @@ function opt(name, fallback = undefined) {
   const i = argv.indexOf(name);
   return i !== -1 ? argv[i + 1] : fallback;
 }
+// Collect every occurrence of a repeatable value-taking flag.
+function optsAll(name) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name && argv[i + 1] !== undefined) { out.push(argv[i + 1]); i++; }
+  }
+  return out;
+}
 function positional(skip = 1) {
-  const VALUE_FLAGS = new Set(["--interval", "--config", "--url", "--within", "--port", "--manifest", "--out", "--key", "--pins", "--spec", "--json-out", "--batch", "--env-file", "--cwd", "--save-manifest", "--threshold", "--parallel", "--timeout", "--subject", "--predicate", "--since", "--until", "--layer", "--evidence-dir", "--server", "--corpus", "--seed", "--probe", "--tool", "--implementation", "--namespace", "--expires-in", "--claims", "--publisher-name"]);
+  const VALUE_FLAGS = new Set(["--interval", "--config", "--url", "--within", "--port", "--manifest", "--out", "--key", "--pins", "--spec", "--json-out", "--batch", "--env-file", "--cwd", "--save-manifest", "--threshold", "--parallel", "--timeout", "--subject", "--predicate", "--since", "--until", "--layer", "--evidence-dir", "--server", "--corpus", "--seed", "--probe", "--tool", "--implementation", "--namespace", "--expires-in", "--claims", "--publisher-name", "--publisher-key", "--scopes", "--secret", "--secret-file", "--auth-secret", "--auth-secret-file", "--allow-tool", "--require-scopes", "--manifest-dir", "--transport", "--header"]);
   const out = [];
   for (let i = skip; i < argv.length; i++) {
     const a = argv[i];
@@ -66,6 +75,9 @@ function usage() {
 
 Fleet operations (JSON client configs):
   mcp-trustcard status --config <file> [--json]
+  mcp-trustcard gate --config <file> [--server <name>] [--port <n>] [--apply] [--json]
+                        (preview by default; --apply writes manifests and
+                        rewrites config entries — HTTP needs mcp-http-proxy running)
   mcp-trustcard renew --config <file> [--server <name>] [--within <days>] [--dry-run] [--json]
   mcp-trustcard reapprove --config <file> [--server <name>] [--dry-run] [--json]
   mcp-trustcard reapprove <manifest.json> --url <endpoint> [--dry-run] [--json]
@@ -74,10 +86,15 @@ Fleet operations (JSON client configs):
 
 Identity & provenance:
   mcp-trustcard fingerprint <spec> [--manifest m.json] [--json]
-  mcp-trustcard manifest <spec> [--key pub.key.json] [--out m.json]
+  mcp-trustcard manifest <spec> [--key pub.key.json] [--expires-in <days>|--no-expiry] [--out m.json]
+                        (builds an UNSIGNED provenance manifest; --key embeds the publisher's
+                        public identity only — it does NOT sign; use "sign" for that)
   mcp-trustcard keygen [--out publisher.key.json]
   mcp-trustcard sign <manifest.json> --key publisher.key.json [--out signed.json]
-  mcp-trustcard verify <signed.json> [--spec <pkg>]
+                        (embeds publisher identity derived from --key; refuses proxy manifests)
+  mcp-trustcard verify <signed.json> [--spec <pkg>] [--publisher-key <key-or-file>] [--pins <path>]
+                        (a valid signature alone proves self-asserted provenance;
+                        --publisher-key/--pins anchor the publisher key out-of-band)
   mcp-trustcard diff <old.json> <new.json> [--verbose]
 
 Capability descriptor (protocol-neutral):
@@ -103,10 +120,11 @@ Health scorecard (scanner):
   mcp-trustcard scan --batch servers.json [--json-out results.json] [--parallel n]
   mcp-trustcard scan-config <config.json>      # scan an MCP config for exposed secrets
   mcp-trustcard gen-manifest <spec> --save-manifest <file>   # proxy-enforcement manifest
-  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...] [--require-scopes <tool>:<s1,s2>] [--expires-in <days>|--no-expiry]
+  mcp-trustcard gen-manifest -- <cmd> [args...] --save-manifest <file> [--allow-tool <name>...] [--require-scopes <tool>=<s1,s2>] [--expires-in <days>|--no-expiry]
   mcp-trustcard inspect <file>                 # inspect a manifest or pin store
-  mcp-trustcard auth-issue --subject <id> --scopes <s1,s2> --secret <hex>  # issue a dev-mode token
-  mcp-trustcard auth-verify <token> --secret <hex>  # verify a dev-mode token
+  mcp-trustcard auth-issue --subject <id> --scopes <s1,s2> --secret-file <path|->   # issue a dev-mode token
+  mcp-trustcard auth-verify <token> --secret-file <path|->   # verify a dev-mode token
+                        (secrets: prefer --secret-file or TRUSTCARD_AUTH_SECRET over --secret argv)
   mcp-trustcard <spec>                         # shorthand for scan
 
 Evidence substrate (observatory):
@@ -129,6 +147,7 @@ function badge(status) {
   if (status === "CONFIG_REQUIRED") return blue("CONFIG");
   if (status === "REQUIRED") return blue("REQUIRED");
   if (status === "FAIL") return red("FAIL");
+  if (status === "SKIPPED") return dim("SKIPPED");
   return dim("UNKNOWN");
 }
 
@@ -337,23 +356,23 @@ async function cmdGenManifest() {
     }
   }
 
-  // Collect --require-scopes <tool>:<scope1,scope2,...> overrides (can be repeated).
-  // Format: --require-scopes read_file=read:files,write:disk
-  // Special case: --require-scopes *:read:files applies to all tools.
+  // Collect --require-scopes overrides (repeatable). Documented form:
+  //   --require-scopes read_file=read:files,write:disk   (tool=scope,scope,...)
+  //   --require-scopes "*=read:files"                     (wildcard: all tools)
+  // The older colon form (tool:scope,scope) is still accepted. A tool name that
+  // does not match an enumerated tool is an error — overrides must never be
+  // silently dropped.
   const scopeOverrides = {};
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--require-scopes" && argv[i + 1]) {
       const spec = argv[i + 1];
-      const colonIdx = spec.indexOf(":");
-      if (colonIdx === -1) { console.error(`--require-scopes: expected <tool>:<scope1,scope2,...>, got "${spec}"`); process.exit(2); }
-      const tool = spec.slice(0, colonIdx);
-      const scopes = spec.slice(colonIdx + 1).split(",").map((s) => s.trim()).filter(Boolean);
-      if (tool === "*") {
-        // Apply to all tools — we'll handle this after we enumerate them.
-        scopeOverrides["*"] = scopes;
-      } else {
-        scopeOverrides[tool] = scopes;
-      }
+      let sepIdx = spec.indexOf("=");
+      if (sepIdx === -1) sepIdx = spec.indexOf(":");
+      if (sepIdx <= 0) { console.error(`--require-scopes: expected <tool>=<scope1,scope2,...>, got "${spec}"`); process.exit(2); }
+      const tool = spec.slice(0, sepIdx).trim();
+      const scopes = spec.slice(sepIdx + 1).split(",").map((s) => s.trim()).filter(Boolean);
+      if (scopes.length === 0) { console.error(`--require-scopes: "${spec}" declares no scopes`); process.exit(2); }
+      scopeOverrides[tool] = scopes;
       i++;
     }
   }
@@ -378,13 +397,16 @@ async function cmdGenManifest() {
   } else {
     const spec = posSpec;
     if (!spec) { console.error("gen-manifest: missing <spec> or -- <cmd> [args...]"); process.exit(2); }
-    const npmCandidates = ["npm", "/opt/homebrew/bin/npm", "/usr/local/bin/npm"];
-    let npmBin = "npm";
-    for (const candidate of npmCandidates) {
-      try { await exec(`${candidate} --version`, { timeout: 5_000, env: process.env }); npmBin = candidate; break; } catch {}
+    // Spec is validated and passed to npm/npx as an argv element — never a
+    // shell string — so substitutions/backticks in it stay literal.
+    try { assertNpmSpec(spec); }
+    catch (e) { console.error(`gen-manifest: ${e.message}`); process.exit(2); }
+    try {
+      await npmView(spec, ["name", "version", "bin"]);
+    } catch (e) {
+      console.error(`gen-manifest: package spec does not resolve in the npm registry: ${e.message?.slice(0, 120)}`);
+      process.exit(2);
     }
-    const { stdout } = await exec(`${npmBin} view ${JSON.stringify(spec)} name version bin --json`, { timeout: 30_000, env: process.env });
-    JSON.parse(stdout); // verify it resolves
     cmd = "npx"; args = ["-y", spec]; specStr = spec;
   }
 
@@ -406,7 +428,7 @@ async function cmdGenManifest() {
         init = await client.request("initialize", {
           protocolVersion: v,
           capabilities: {},
-          clientInfo: { name: "mcp-trustcard", version: "2.0.0" },
+          clientInfo: { name: "mcp-trustcard", version: TRUSTCARD_VERSION },
         }, 15_000);
         break;
       } catch (e) { lastErr = e; }
@@ -415,6 +437,18 @@ async function cmdGenManifest() {
     client.notify("notifications/initialized", {});
     const res = await client.request("tools/list", {}, 10_000);
     const tools = Array.isArray(res?.tools) ? res.tools : [];
+    // Overrides that name a tool the server doesn't expose are operator
+    // errors (typos, stale scripts). They silently did nothing before; that is
+    // how permission gates get quietly bypassed, so reject them loudly.
+    const toolNames = new Set(tools.map((t) => t.name));
+    const unknownScopeTools = Object.keys(scopeOverrides).filter((n) => n !== "*" && !toolNames.has(n));
+    const unknownAllowTools = allowTools.filter((n) => !toolNames.has(n));
+    if (unknownScopeTools.length || unknownAllowTools.length) {
+      if (unknownScopeTools.length) console.error(`gen-manifest: --require-scopes references tool(s) the server does not expose: ${unknownScopeTools.join(", ")}`);
+      if (unknownAllowTools.length) console.error(`gen-manifest: --allow-tool references tool(s) the server does not expose: ${unknownAllowTools.join(", ")}`);
+      console.error(`  enumerated tools: ${[...toolNames].join(", ") || "(none)"}`);
+      process.exit(2);
+    }
     // Expand wildcard scope overrides to all tools
     const finalScopeOverrides = {};
     if (scopeOverrides["*"]) {
@@ -496,14 +530,35 @@ async function cmdManifest() {
   let publisher;
   if (keyPath) {
     const k = loadJson(keyPath);
+    // --key embeds the publisher's PUBLIC identity in the manifest. It does not
+    // sign anything — signing is a separate step (`mcp-trustcard sign`).
+    if (!k?.keyId || !k?.publicKey) {
+      console.error(`manifest: --key ${keyPath} must contain keyId and publicKey (a public key file, or the full keygen output)`);
+      process.exit(2);
+    }
     publisher = { keyId: k.keyId, publicKey: k.publicKey };
   } else {
     publisher = { keyId: "unpublished", publicKey: "" };
   }
-  const manifest = buildManifest({ serverInfo: obs.serverInfo, protocolVersion: obs.protocolVersion, tools: obs.tools, publisher });
+  // Provenance manifests expire by default (90 days, same as proxy policy):
+  // a signed toolset should be re-attested periodically, not trusted forever.
+  // --expires-in <days> overrides; --no-expiry emits expiresAt: null.
+  const expiresFlag = opt("--expires-in");
+  const expiresInDays = expiresFlag === "none" || argv.includes("--no-expiry")
+    ? null
+    : expiresFlag !== undefined ? parseInt(expiresFlag, 10) : 90;
+  if (expiresInDays !== null && (!Number.isFinite(expiresInDays) || expiresInDays <= 0)) {
+    console.error(`manifest: --expires-in must be a positive number of days (or --no-expiry)`);
+    process.exit(2);
+  }
+  const expiresAt = expiresInDays != null ? new Date(Date.now() + expiresInDays * 86_400_000).toISOString() : null;
+  const manifest = buildManifest({ serverInfo: obs.serverInfo, protocolVersion: obs.protocolVersion, tools: obs.tools, publisher, expiresAt });
   const out = opt("--out");
   if (out) writeFileSync(out, JSON.stringify(manifest, null, 2) + "\n");
   else console.log(JSON.stringify(manifest, null, 2));
+  // Confirmation goes to stderr: stdout stays pure JSON for piping.
+  console.error(`${green("✓")} unsigned manifest built${out ? ` → ${out}` : ""} — ${manifest.tools.length} tool(s), expires ${manifest.expiresAt ?? "never"}`);
+  console.error(dim(`  publisher identity ${publisher.keyId === "unpublished" ? "not embedded (pass --key <publisher key file>)" : `embedded as ${publisher.keyId}`} — manifest is NOT signed; run \`mcp-trustcard sign\` with the publisher private key`));
 }
 
 async function cmdKeygen() {
@@ -530,26 +585,105 @@ async function cmdSign() {
   const manifestPath = positional(1)[0];
   const keyPath = opt("--key");
   if (!manifestPath || !keyPath) { console.error("sign requires <manifest.json> --key <publisher.key.json>"); process.exit(2); }
-  const manifest = loadJson(manifestPath);
-  const key = loadJson(keyPath);
-  const signed = signManifest(manifest, key.privateKey);
+  let manifest, key;
+  try { manifest = loadJson(manifestPath); } catch (e) { console.error(`sign: cannot read manifest: ${e.message}`); process.exit(2); }
+  try { key = loadJson(keyPath); } catch (e) { console.error(`sign: cannot read key file: ${e.message}`); process.exit(2); }
+  if (!key?.privateKey) { console.error(`sign: --key ${keyPath} has no privateKey (generate one with \`mcp-trustcard keygen\`)`); process.exit(2); }
+  // Fail fast on the wrong document class: a proxy manifest is call-time
+  // policy, not provenance, and signing it is meaningless.
+  if (isProxyManifest(manifest)) {
+    console.error(`sign: ${manifestPath} is a proxy-enforcement manifest (gen-manifest format)`);
+    console.error(`      proxy manifests are local call-time policy and are never signed.`);
+    console.error(`      to produce a signable provenance manifest: \`mcp-trustcard manifest <spec> --key <publisher-key.json> --out m.json\``);
+    process.exit(2);
+  }
+  // If the key file also declares a publicKey/keyId, it must agree with the
+  // private key — a mismatched key file is malformed input, not a signing choice.
+  try {
+    const derived = publisherFromSecret(key.privateKey);
+    if (key.publicKey && key.publicKey !== derived.publicKey) {
+      console.error(`sign: key file's publicKey does not match its privateKey — malformed key file`);
+      process.exit(2);
+    }
+    if (key.keyId && key.keyId !== derived.keyId) {
+      console.error(`sign: key file's keyId does not match its privateKey — malformed key file`);
+      process.exit(2);
+    }
+  } catch (e) {
+    console.error(`sign: --key ${keyPath} does not contain a valid Ed25519 private key: ${e.message}`);
+    process.exit(2);
+  }
+  let signed;
+  try {
+    signed = signManifest(manifest, key.privateKey);
+  } catch (e) {
+    console.error(`sign: ${e.message}`);
+    process.exit(2);
+  }
+  // Never report success for a manifest we cannot verify — self-check the
+  // signed output before declaring it good.
+  const check = verifyManifest(signed);
+  if (!check.ok) {
+    console.error(`sign: produced an unverifiable manifest — refusing to report success:`);
+    for (const e of check.errors) console.error(`  ${red("✗")} ${e}`);
+    process.exit(1);
+  }
   const out = opt("--out");
   if (out) writeFileSync(out, JSON.stringify(signed, null, 2) + "\n");
   else console.log(JSON.stringify(signed, null, 2));
-  console.error(`${green("✓")} signed with ${signed.signature.keyId}`);
+  console.error(`${green("✓")} signed with ${signed.signature.keyId} (publisher identity embedded from the signing key)`);
+}
+
+// Resolve a --publisher-key value into a trust anchor: an existing JSON file
+// ({keyId, publicKey} — e.g. keygen output or a public-only split), a literal
+// "sha256:..." keyId, or a base64url spki public key.
+function publisherAnchorFrom(value) {
+  if (!value) return null;
+  if (existsSync(value)) {
+    let doc;
+    try { doc = loadJson(value); } catch (e) { console.error(`verify: cannot read --publisher-key file ${value}: ${e.message}`); process.exit(2); }
+    const anchor = normalizeTrustedKey(doc);
+    if (!anchor) { console.error(`verify: --publisher-key file ${value} contains no keyId or publicKey`); process.exit(2); }
+    return anchor;
+  }
+  return normalizeTrustedKey(value);
 }
 
 async function cmdVerify() {
   const manifestPath = positional(1)[0];
   if (!manifestPath) { usage(); process.exit(2); }
   const manifest = loadJson(manifestPath);
-  const result = verifyManifest(manifest);
+
+  // Out-of-band trust anchors. Cryptographic validity alone proves only that
+  // *someone* signed the manifest; anchoring decides whether that someone is
+  // the publisher you trust.
+  const trustedKeys = [];
+  for (const v of optsAll("--publisher-key")) {
+    const a = publisherAnchorFrom(v);
+    if (!a) { console.error(`verify: --publisher-key "${v}" is not a keyId, public key, or key file`); process.exit(2); }
+    trustedKeys.push(a);
+  }
+  const pinsPath = opt("--pins");
+  if (pinsPath !== undefined) {
+    const pins = new PinStore(pinsPath);
+    const publishers = pins.list()?.publishers ?? {};
+    for (const [keyId, p] of Object.entries(publishers)) {
+      if (p?.publicKey) trustedKeys.push({ keyId, publicKey: p.publicKey });
+    }
+    if (Object.keys(publishers).length === 0) {
+      console.error(`verify: --pins ${pinsPath} contains no publisher pins — nothing to anchor trust to`);
+      process.exit(2);
+    }
+  }
+
+  const result = verifyManifest(manifest, { trustedKeys });
   const spec = opt("--spec");
   let binding = null;
   if (spec && result.ok) {
     const obs = await observeServer({ cmd: "npx", args: ["-y", spec], env: {} });
     binding = obs.error ? { consistent: false, problems: [obs.error] } : bindingConsistency(manifest, obs);
   }
+  const anchorSupplied = trustedKeys.length > 0;
   if (flag("--json")) {
     console.log(JSON.stringify({ ...result, binding }, null, 2));
   } else {
@@ -558,13 +692,22 @@ async function cmdVerify() {
     console.log(dim("─".repeat(72)));
     console.log(`${"Signature + digests".padEnd(26)} ${result.ok ? green("VERIFIED") : red("INVALID")}  ${result.keyId ? dim("key " + result.keyId.slice(0, 20) + "…") : ""}`);
     for (const e of result.errors) console.log(`${"".padEnd(26)} ${red("✗")} ${dim(e)}`);
+    const t = result.trust;
+    if (t?.anchored) {
+      console.log(`${"Publisher trust".padEnd(26)} ${green("ANCHORED")}  ${dim(t.detail)}`);
+    } else if (anchorSupplied) {
+      console.log(`${"Publisher trust".padEnd(26)} ${red("UNTRUSTED")}  ${dim(t?.detail ?? "")}`);
+    } else {
+      console.log(`${"Publisher trust".padEnd(26)} ${yellow("SELF-ASSERTED")}  ${dim(t?.detail ?? "")}`);
+    }
     if (binding) {
       console.log(`${"Live binding".padEnd(26)} ${binding.consistent ? green("CONSISTENT") : red("DRIFT")}  ${dim(spec ?? "")}`);
       for (const p of binding.problems) console.log(`${"".padEnd(26)} ${red("✗")} ${dim(p)}`);
     }
     console.log("");
   }
-  process.exit(result.ok && (!binding || binding.consistent) ? 0 : 1);
+  const failed = !result.ok || (anchorSupplied && !result.trust.anchored) || (binding && !binding.consistent);
+  process.exit(failed ? 1 : 0);
 }
 
 async function cmdDiff() {
@@ -594,8 +737,13 @@ async function cmdPin() {
     obs = await observeServer({ cmd: "npx", args: ["-y", spec], env: injectedEnv });
   }
   if (obs.error) { console.error(red(`probe failed: ${obs.error}`)); process.exit(1); }
-  const key = pins.serverKey(obs.serverInfo ?? (local ? `${local.cmd} ${local.args.join(" ")}` : posSpec));
-  pins.pinServer(key, obs);
+  // Bind the pin to the route the operator configured (spec or command line),
+  // not just the server's self-reported name@version — an impostor can copy a
+  // self-report, and two unnamed servers must not collapse into "?@?".
+  const origin = local ? `${local.cmd} ${local.args.join(" ")}`.trim() : String(posSpec);
+  const serverId = { ...(obs.serverInfo ?? {}), origin };
+  const key = pins.serverKey(serverId);
+  pins.pinServer(serverId, obs);
   console.log(`${green("✓")} pinned ${bold(key)}`);
   console.log(`  toolset: ${obs.toolsetDigest}`);
   console.log(`  server:  ${obs.serverDigest}`);
@@ -632,16 +780,45 @@ async function cmdPins() {
   console.log("");
 }
 
+// Read an auth secret without putting it on the command line.
+// Order: --secret-file <path> ("-" = stdin), then --secret <hex> (argv —
+// visible to every local process via `ps`; use only for throwaway dev keys),
+// then TRUSTCARD_AUTH_SECRET.
+async function resolveAuthSecret(cmdName) {
+  const file = opt("--secret-file");
+  if (file != null) {
+    const value = file === "-"
+      ? await new Promise((resolve, reject) => {
+          const chunks = [];
+          process.stdin.on("data", (c) => chunks.push(c));
+          process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+          process.stdin.on("error", reject);
+        })
+      : readFileSync(file, "utf8");
+    const secret = value.trim();
+    if (!secret) { console.error(`${cmdName}: --secret-file ${file} is empty`); process.exit(2); }
+    return secret;
+  }
+  const argvSecret = opt("--secret");
+  if (argvSecret) {
+    process.stderr.write(`warn: --secret exposes the key in the process list; prefer --secret-file or TRUSTCARD_AUTH_SECRET\n`);
+    return argvSecret;
+  }
+  const envSecret = process.env.TRUSTCARD_AUTH_SECRET;
+  if (envSecret) return envSecret;
+  console.error(`${cmdName}: missing secret — use --secret-file <path|-> or set TRUSTCARD_AUTH_SECRET (--secret works but leaks via argv)`);
+  process.exit(2);
+}
+
 // auth-issue: issue a dev-mode token (HMAC-signed JWT-like).
-// Usage: mcp-trustcard auth-issue --subject <agent-id> --scopes <scope1,scope2,...> [--secret <hex>] [--expires-in <seconds>]
+// Usage: mcp-trustcard auth-issue --subject <agent-id> --scopes <scope1,scope2,...> [--secret-file <path|->] [--expires-in <seconds>]
 async function cmdAuthIssue() {
   const { DevIssuer } = await import("../lib/auth.js");
   const subject = opt("--subject") ?? positional(1)[0];
   if (!subject) { console.error("auth-issue: missing --subject <agent-id>"); process.exit(2); }
   const scopesStr = opt("--scopes") ?? "";
   const scopes = scopesStr.split(",").map((s) => s.trim()).filter(Boolean);
-  const secret = opt("--secret") ?? process.env.TRUSTCARD_AUTH_SECRET;
-  if (!secret) { console.error("auth-issue: missing --secret <hex> (or set TRUSTCARD_AUTH_SECRET env var)"); process.exit(2); }
+  const secret = await resolveAuthSecret("auth-issue");
   const expiresIn = parseInt(opt("--expires-in") ?? "3600", 10);
 
   const issuer = new DevIssuer({ secret });
@@ -659,13 +836,12 @@ async function cmdAuthIssue() {
 }
 
 // auth-verify: verify a dev-mode token and print its claims.
-// Usage: mcp-trustcard auth-verify <token> --secret <hex>
+// Usage: mcp-trustcard auth-verify <token> [--secret-file <path|->]
 async function cmdAuthVerify() {
   const { DevIssuer } = await import("../lib/auth.js");
   const token = positional(1)[0];
   if (!token) { console.error("auth-verify: missing <token>"); process.exit(2); }
-  const secret = opt("--secret") ?? process.env.TRUSTCARD_AUTH_SECRET;
-  if (!secret) { console.error("auth-verify: missing --secret <hex> (or set TRUSTCARD_AUTH_SECRET env var)"); process.exit(2); }
+  const secret = await resolveAuthSecret("auth-verify");
 
   const issuer = new DevIssuer({ secret });
   const decoded = issuer.verify(token);
@@ -711,14 +887,61 @@ async function cmdInspect() {
 
   const isSigned = !!data.signature;
   const isProxy = data.version === 1 && Array.isArray(data.tools) && !data.signature;
+  const isProvenance = !isSigned && !isProxy && data.schema === MANIFEST_SCHEMA_VERSION;
   const isPinStore = data.schema === "trustcard.dev/pins@1";
 
-  if (isSigned) return inspectSignedManifest(data, file);
-  if (isProxy) return inspectProxyManifest(data, file);
+  if (isSigned) {
+    const ok = inspectSignedManifest(data, file);
+    if (!ok) process.exit(1);
+    return;
+  }
+  if (isProvenance) {
+    const ok = inspectProvenanceManifest(data, file);
+    if (!ok) process.exit(1);
+    return;
+  }
+  if (isProxy) {
+    const ok = inspectProxyManifest(data, file);
+    if (!ok) process.exit(1);
+    return;
+  }
   if (isPinStore) return inspectPinStore(data, file);
 
   console.error(`inspect: unrecognized file format (no signature, no version=1 tools, no pins schema)`);
   process.exit(1);
+}
+
+// An unsigned provenance manifest (the `manifest` command's output before
+// `sign` is run). Exit nonzero when any recorded digest fails to recompute.
+function inspectProvenanceManifest(m, file) {
+  console.log(`Trustcard Provenance Manifest (unsigned): ${file}`);
+  console.log("─".repeat(60));
+  console.log(`  Schema:     ${m.schema}`);
+  console.log(`  Server:     ${m.server?.name ?? "?"} ${m.server?.version ?? ""}`);
+  console.log(`  Publisher:  ${m.publisher?.keyId ?? "none"}`);
+  console.log(`  Identity:   ${m.manifestDigest}`);
+  console.log(`  Signed:     no — sign with \`mcp-trustcard sign ${file} --key publisher.key.json\``);
+  console.log(`  Issued:     ${m.issuedAt ?? "?"}`);
+  console.log(`  Expires:    ${m.expiresAt ?? "never"}`);
+  const errors = [];
+  if (m.manifestDigest && m.manifestDigest !== hashManifestPayload(m)) {
+    errors.push(`manifestDigest mismatch — payload hashes to ${hashManifestPayload(m)}`);
+  }
+  if (m.toolsetDigest && m.toolsetDigest !== toolsetDigest(m.tools)) {
+    errors.push("toolsetDigest mismatch");
+  }
+  const recomputedServer = serverDigest({ serverInfo: m.server, protocolVersion: m.protocol?.negotiated, tools: m.tools });
+  if (m.serverDigest && m.serverDigest !== recomputedServer) errors.push("serverDigest mismatch");
+  if (!m.manifestDigest) errors.push("missing manifestDigest");
+  if (m.expiresAt && Date.parse(m.expiresAt) < Date.now()) errors.push(`expired at ${m.expiresAt}`);
+  if (errors.length === 0) {
+    console.log(`  Digests:    all recorded digests recompute cleanly`);
+  } else {
+    console.log(`  Digests:    INVALID`);
+    for (const e of errors) console.log(`    - ${e}`);
+  }
+  console.log(`  Tools:      ${m.tools?.length ?? 0}`);
+  return errors.length === 0;
 }
 
 function inspectProxyManifest(m, file) {
@@ -729,6 +952,8 @@ function inspectProxyManifest(m, file) {
   console.log(`  Hash:       ${m.manifestHash}`);
   console.log(`  Created:    ${m.createdAt}`);
   console.log(`  Expires:    ${m.expiresAt ?? "never"}${m.expiresAt && Date.parse(m.expiresAt) < Date.now() ? " (EXPIRED)" : ""}`);
+  const hs = manifestHashStatus(m);
+  console.log(`  Integrity:  ${hs.ok ? (hs.format === "legacy-v1" ? `OK (legacy hash — scopes/contract not covered)` : `OK (policy hash covers decisions, scopes, contracts)`) : `MISMATCH — ${hs.detail}`}`);
   console.log(`  Tools:      ${m.summary.totalTools} total, ${m.summary.allowedTools} allowed, ${m.summary.dangerousTools} dangerous${m.summary.overriddenTools ? `, ${m.summary.overriddenTools} overridden` : ""}`);
   console.log("");
   console.log("  Tools:");
@@ -737,6 +962,7 @@ function inspectProxyManifest(m, file) {
     const danger = t.dangerScore > 0 ? ` danger=${t.dangerScore}(${t.dangerConfidence})` : "";
     console.log(`    ${t.name.padEnd(36)} ${status}${danger}`);
   }
+  return hs.ok;
 }
 
 function inspectSignedManifest(m, file) {
@@ -763,6 +989,7 @@ function inspectSignedManifest(m, file) {
       console.log(`    ${t.name.padEnd(36)} schema=${(m.toolDigests?.[t.name] ?? "?").slice(0, 16)}`);
     }
   }
+  return v.ok;
 }
 
 function inspectPinStore(data, file) {
@@ -1073,7 +1300,15 @@ async function cmdBehavior() {
   const verbose = flag("--verbose");
 
   const baseDir = cwd ? resolvePath(cwd) : process.cwd();
-  const resolvedArgs = (server.args ?? []).map((a) => (isAbsolute(a) ? a : resolvePath(baseDir, a)));
+  // Only resolve args that look like filesystem paths — flags (-y), package
+  // specs (@scope/pkg) and other literals must pass through verbatim. The
+  // runtime runs the child with a temp cwd, so relative paths still need
+  // pinning to baseDir; everything else is handed to the process untouched.
+  const resolvedArgs = (server.args ?? []).map((a) => {
+    if (typeof a !== "string" || a.startsWith("-") || isAbsolute(a)) return a;
+    const looksPath = a.startsWith("./") || a.startsWith("../") || a.startsWith("~") || existsSync(resolvePath(baseDir, a));
+    return looksPath ? resolvePath(baseDir, a) : a;
+  });
   const runtime = new SandboxRuntime({
     cmd: server.cmd,
     args: resolvedArgs,
@@ -1295,8 +1530,11 @@ async function cmdDescriptorPin() {
 async function cmdRenew(reapprove = false) {
   const fleet = await import("../lib/fleet.js");
   const days = opt("--expires-in") != null ? Number(opt("--expires-in")) : 90;
-  const within = opt("--within") != null ? Number(opt("--within")) : null;
-  if (!Number.isFinite(days) || days <= 0 || (within != null && (!Number.isFinite(within) || within < 0))) { console.error("expiry must be positive and --within nonnegative (finite days)"); process.exitCode = 2; return; }
+  // Default renewal window is 14 days — matching watch/renewalPass. Pass
+  // --within 0 to only touch already-expired manifests, or a larger window to
+  // renew further ahead of expiry.
+  const within = opt("--within") != null ? Number(opt("--within")) : 14;
+  if (!Number.isFinite(days) || days <= 0 || !Number.isFinite(within) || within < 0) { console.error("expiry must be positive and --within nonnegative (finite days)"); process.exitCode = 2; return; }
   const dryRun = argv.includes("--dry-run");
   const asJson = argv.includes("--json");
   const configPath = opt("--config");
@@ -1320,10 +1558,137 @@ async function cmdRenew(reapprove = false) {
   }
   if (asJson) console.log(JSON.stringify({ results }, null, 2));
   else for (const r of results) {
-    const mark = r.action === "renewed" || r.action === "would-renew" ? "✓" : r.action === "skipped" ? "·" : "✗";
-    console.log(`${mark} ${r.name.padEnd(22)} ${r.action.padEnd(12)} ${r.expiresAt ?? r.reason ?? ""}`);
+    // ✓ = applied, ◌ = dry-run preview (nothing written), · = skipped, ✗ = failed
+    const mark = !r.ok ? "✗"
+      : r.action === "skipped" ? "·"
+      : r.action?.startsWith("would-") ? "◌"
+      : "✓";
+    console.log(`${mark} ${r.name.padEnd(22)} ${r.action.padEnd(20)} ${r.expiresAt ?? r.reason ?? ""}`);
   }
   if (results.some((r) => !r.ok)) process.exitCode = 1;
+}
+
+// gate: preview or apply manifest gating for servers in a client config.
+//   mcp-trustcard gate --config <file> [--server <name>] [--port <n>]
+//                      [--expires-in <days>] [--manifest-dir <dir>]
+//                      [--transport streamable-http|sse] [--apply] [--json]
+//
+// Stdio entries are wrapped in mcp-proxy; HTTP/SSE entries get a generated
+// manifest plus a rewritten config entry pointing at a local mcp-http-proxy.
+// PREVIEW IS THE DEFAULT — nothing is written until --apply. Gating HTTP
+// traffic additionally requires the operator to run the printed mcp-http-proxy
+// command; until both steps are done the entry is UNGATED.
+async function cmdGate() {
+  const fleet = await import("../lib/fleet.js");
+  const configPath = opt("--config");
+  if (!configPath || !existsSync(configPath)) { console.error("gate: missing --config <client-config.json>"); process.exit(2); }
+  const apply = flag("--apply");
+  const asJson = flag("--json");
+  const port = opt("--port") != null ? parseInt(opt("--port"), 10) : 9876;
+  const days = opt("--expires-in") != null ? Number(opt("--expires-in")) : 90;
+  if (!Number.isFinite(days) || days <= 0) { console.error("gate: --expires-in must be a positive number of days"); process.exit(2); }
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) { console.error("gate: --port must be a valid TCP port"); process.exit(2); }
+
+  const { raw, servers } = fleet.readJsonConfig(configPath);
+  const configDir = dirname(resolvePath(configPath));
+  const { ungated } = fleet.listGated(configPath);
+  const ungatedNames = new Set(ungated.map((u) => u.name));
+  const only = opt("--server");
+  if (only && servers[only] && !ungatedNames.has(only)) { console.error(`gate: "${only}" is already gated`); process.exitCode = 2; return; }
+  if (only && !servers[only]) { console.error(`gate: no configured server named "${only}"`); process.exit(2); }
+  const names = Object.keys(servers).filter((n) => ungatedNames.has(n) && (!only || n === only));
+  if (!names.length) { console.log(dim("Nothing to gate — every configured server is already wrapped.")); return; }
+
+  const manifestDir = opt("--manifest-dir") ?? join(configDir, "trustcard-manifests");
+  const proxyJs = join(dirname(fileURLToPath(import.meta.url)), "mcp-proxy.js");
+  const httpProxyJs = join(dirname(fileURLToPath(import.meta.url)), "mcp-http-proxy.js");
+  const plans = [];
+  for (const name of names) {
+    const entry = servers[name];
+    const url = entry.url ?? entry.serverUrl;
+    const transport = url ? (opt("--transport") ?? "streamable-http") : null;
+    const manifestPath = join(manifestDir, `${name.replace(/[^\w.-]/g, "_")}.manifest.json`);
+    let live;
+    try {
+      live = await fleet.listLiveTools(url
+        ? { url, headers: entry.headers ?? {}, transport }
+        : { cmd: entry.command, args: entry.args ?? [], env: entry.env ?? {}, cwd: entry.cwd });
+    } catch (e) {
+      plans.push({ name, ok: false, error: `discovery failed: ${e.message}` });
+      continue;
+    }
+    const specStr = url ?? `${entry.command} ${(entry.args ?? []).join(" ")}`.trim();
+    const manifest = buildProxyManifest(live.tools, live.serverInfo ?? null, specStr, null, days);
+    let nextEntry, proxyCommand;
+    if (url) {
+      if (!/^https?:\/\//i.test(url)) { plans.push({ name, ok: false, error: `not an http(s) url: ${url}` }); continue; }
+      let upstreamPath = "";
+      try { upstreamPath = new URL(url).pathname; } catch { upstreamPath = ""; }
+      const urlKey = entry.serverUrl != null ? "serverUrl" : "url";
+      const meta = {
+        ...(entry._meta ?? {}),
+        [fleet.TRUSTCARD_HTTP_GATE_KEY]: {
+          manifest: manifestPath,
+          upstream: url,
+          proxy: "mcp-http-proxy",
+          gatedAt: new Date().toISOString(),
+        },
+      };
+      nextEntry = { ...entry, [urlKey]: `http://127.0.0.1:${port}${upstreamPath}`, _meta: meta };
+      proxyCommand = `${process.execPath} ${httpProxyJs} --manifest ${manifestPath} --upstream ${url} --port ${port}`;
+    } else {
+      nextEntry = {
+        ...entry,
+        command: process.execPath,
+        args: [proxyJs, "--manifest", manifestPath, "--", entry.command, ...(entry.args ?? [])],
+      };
+      proxyCommand = null; // the wrapper is the config entry itself
+    }
+    plans.push({ name, ok: true, tools: live.tools.length, manifestPath, manifest, nextEntry, proxyCommand });
+  }
+
+  const failed = plans.filter((p) => !p.ok);
+  const planned = plans.filter((p) => p.ok);
+
+  if (asJson) {
+    console.log(JSON.stringify({
+      applied: apply,
+      config: configPath,
+      servers: plans.map((p) => p.ok
+        ? { name: p.name, tools: p.tools, manifestPath: p.manifestPath, entry: p.nextEntry, proxyCommand: p.proxyCommand }
+        : { name: p.name, error: p.error }),
+    }, null, 2));
+  } else {
+    console.log(bold(apply ? "Applying gates:" : "Gate preview (nothing written — pass --apply to write):"));
+    for (const p of plans) {
+      if (!p.ok) { console.log(`  ✗ ${p.name.padEnd(22)} ${p.error}`); continue; }
+      console.log(`  ${apply ? "✓" : "◌"} ${p.name.padEnd(22)} ${p.tools} tool(s) → ${p.manifestPath}`);
+      console.log(`    config entry: ${dim(JSON.stringify(p.nextEntry))}`);
+      if (p.proxyCommand) console.log(`    run proxy:    ${dim(p.proxyCommand)}`);
+    }
+    if (planned.length && !apply) {
+      console.log(dim("\n  --apply writes the manifest(s) and rewrites the config entries above."));
+      console.log(dim("  For HTTP servers the printed mcp-http-proxy command must ALSO be running;"));
+      console.log(dim("  until then the entry is ungated (the proxy refuses to start without its manifest)."));
+    }
+    if (planned.length && apply && planned.some((p) => p.proxyCommand)) {
+      console.log(dim("\n  HTTP gates require the printed mcp-http-proxy process to be running."));
+      console.log(dim("  `status`/`renew`/`reapprove` discover the upstream recorded in _meta."));
+    }
+  }
+
+  if (apply && planned.length) {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(manifestDir, { recursive: true });
+    const serversKey = raw.mcpServers ? "mcpServers" : "servers";
+    for (const p of planned) {
+      fleet.atomicWriteJson(p.manifestPath, p.manifest);
+      raw[serversKey][p.name] = p.nextEntry;
+    }
+    fleet.atomicWriteJson(configPath, raw);
+    if (!asJson) console.log(green(`\nApplied: ${planned.length} gate(s) written; config updated (backup alongside).`));
+  }
+  if (failed.length) process.exitCode = 1;
 }
 
 // status: what is gated, what isn't, and when gates expire.
@@ -1339,13 +1704,13 @@ async function cmdStatus() {
     try { m = JSON.parse(readFileSync(g.manifest, "utf8")); if (!Array.isArray(m.tools)) throw new Error("missing tools"); }
     catch (e) { return { name: g.name, gated: true, state: "invalid-manifest", reason: e.message }; }
     const s = fleet.manifestStatus(m);
-    return { name: g.name, gated: true, ...s, expiresAt: m.expiresAt, tools: m.tools.length, blocked: m.tools.filter((t) => !t.allowed).length, overrides: m.tools.filter((t) => t.manualOverride).length, signaturePresent: !!m.signature, signatureVerified: false };
+    return { name: g.name, gated: true, httpGated: !!g.proxyUrl, proxyUrl: g.proxyUrl, ...s, expiresAt: m.expiresAt, tools: m.tools.length, blocked: m.tools.filter((t) => !t.allowed).length, overrides: m.tools.filter((t) => t.manualOverride).length, signaturePresent: !!m.signature, signatureVerified: false };
   });
   const out = { config: configPath, gated: rows, ungated };
   if (rows.some((r) => ["expired", "missing-manifest", "invalid-manifest", "invalid-expiry"].includes(r.state))) process.exitCode = 1;
   if (argv.includes("--json")) { console.log(JSON.stringify(out, null, 2)); return; }
-  for (const r of rows) console.log(`  ${r.state === "ok" ? "✓" : r.state === "expiring" ? "!" : "✗"} ${r.name.padEnd(22)} ${String(r.state).padEnd(10)} ${r.daysLeft ?? ""}d  tools=${r.tools ?? "?"} blocked=${r.blocked ?? "?"} overrides=${r.overrides ?? "?"}`);
-  for (const u of ungated) console.log(`  - ${u.name.padEnd(22)} UNGATED (${u.transport})`);
+  for (const r of rows) console.log(`  ${r.state === "ok" ? "✓" : r.state === "expiring" ? "!" : "✗"} ${r.name.padEnd(22)} ${String(r.state).padEnd(10)} ${r.daysLeft ?? ""}d  tools=${r.tools ?? "?"} blocked=${r.blocked ?? "?"} overrides=${r.overrides ?? "?"}${r.httpGated ? " (http-gated)" : ""}`);
+  for (const u of ungated) console.log(`  - ${u.name.padEnd(22)} UNGATED (${u.transport})${u.transport === "http" ? " — gate with: mcp-trustcard gate --config <this file> --server " + u.name : ""}`);
   if (rows.some((r) => r.state === "expired" || r.state === "missing-manifest")) process.exitCode = 1;
 }
 
@@ -1359,6 +1724,7 @@ async function main() {
     case "renew": return cmdRenew();
     case "reapprove": return cmdRenew(true);
     case "status": return cmdStatus();
+    case "gate": return cmdGate();
     case "watch": {
       const configPath = opt("--config");
       if (!configPath) throw new Error("watch: --config <JSON file> required");
@@ -1388,11 +1754,60 @@ async function main() {
     case "evidence": return cmdEvidence();
     case "behavior": return cmdBehavior();
     case "descriptor": return cmdDescriptor();
-    default:
-      if (!cmd.startsWith("-")) return cmdScan();
-      usage();
-      process.exit(2);
+    default: {
+      // Bare-argument shorthand for `scan <spec>` is intentional and
+      // documented, but only for things that could actually be a spec —
+      // otherwise a mistyped subcommand would silently trigger a package
+      // download and spawn. Unknown words that look like command typos fail
+      // closed; non-spec garbage fails closed too.
+      if (cmd.startsWith("-")) { usage(); process.exit(2); }
+      if (/^https?:\/\//i.test(cmd)) return cmdScan();
+      if (!isNpmSpec(cmd)) {
+        console.error(`unknown command: ${JSON.stringify(cmd)}`);
+        console.error("run `mcp-trustcard --help` for the command list");
+        process.exit(2);
+      }
+      const near = nearestCommand(cmd);
+      if (near) {
+        console.error(`unknown command "${cmd}" — did you mean \`${near}\`?`);
+        console.error(`(to scan an npm package literally named "${cmd}", run: mcp-trustcard scan ${cmd})`);
+        process.exit(2);
+      }
+      process.stderr.write(dim(`interpreting "${cmd}" as an npm package spec — \`mcp-trustcard scan ${cmd}\` is the explicit form\n`));
+      argv.unshift("scan"); // positional(1) expects argv[0] to be the command name
+      return cmdScan();
+    }
   }
+}
+
+// Edit distance ≤ 2 against the command table catches the classic typo case
+// (`verfy`, `staus`, `descripto`) without eating real package names.
+const SUBCOMMANDS = [
+  "scan", "scan-config", "gen-manifest", "renew", "reapprove", "status",
+  "watch", "console", "inspect", "fingerprint", "manifest", "keygen", "sign",
+  "verify", "diff", "pin", "unpin", "pins", "auth-issue", "auth-verify",
+  "evidence", "behavior", "descriptor", "gate",
+];
+function nearestCommand(word) {
+  if (word.length < 3 || word.includes("/") || word.includes("@") || word.includes(".")) return null;
+  const dist = (a, b) => {
+    const m = a.length, n = b.length;
+    const prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+      prev.splice(0, prev.length, ...cur);
+    }
+    return prev[n];
+  };
+  let best = null, bestD = Infinity;
+  for (const c of SUBCOMMANDS) {
+    const d = dist(word, c);
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return bestD <= 2 ? best : null;
 }
 
 main().catch((e) => { console.error("fatal:", e.message ?? e); process.exit(1); });

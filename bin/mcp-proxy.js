@@ -41,9 +41,10 @@
 // any MCP client that speaks stdio JSON-RPC works without modification.
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson } from "../lib/manifest.js";
+import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson, assertProxyManifest } from "../lib/manifest.js";
 import { atomicWriteJson } from "../lib/fleet.js";
 import { redact } from "../lib/redact.js";
+import { validateArgs } from "../lib/guard.js";
 import { DevIssuer, IdpIntrospector, TokenValidator, extractToken, stripAuth } from "../lib/auth.js";
 
 const args = process.argv.slice(2);
@@ -106,10 +107,14 @@ if (dashIdx === -1 || !args[dashIdx + 1]) {
 const serverCmd = args[dashIdx + 1];
 const serverArgs = args.slice(dashIdx + 2);
 
-// Load manifest
+// Load manifest — and refuse to run on one that fails structural validation.
+// Manifest integrity is enforced before ANY mode flag (including --allow-all)
+// is honored: a malformed or signature-bearing manifest is not a valid
+// enforcement policy and must fail closed.
 let manifest;
 try {
   manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  assertProxyManifest(manifest);
 } catch (e) {
   console.error(`mcp-proxy: failed to load manifest: ${e.message}`);
   process.exit(2);
@@ -117,6 +122,9 @@ try {
 
 let approvedNames = new Set(manifest.tools.map((t) => t.name));
 let driftedNames = new Set();
+// tool name -> live inputSchema, captured from the latest tools/list. Used to
+// validate call arguments for legacy manifests that predate embedded schemas.
+const liveSchemas = new Map();
 
 // --- JSON-RPC plumbing ---
 // The proxy maintains two stdio pipes:
@@ -131,8 +139,14 @@ const server = spawn(serverCmd, serverArgs, {
 
 let clientBuffer = "";
 let serverBuffer = "";
-const pendingServer = new Map();  // id -> method (tracking requests forwarded to server)
-let nextRedirectId = 1;
+// Two independent id spaces:
+//   pendingServer — request ids the CLIENT opened that we forwarded upstream;
+//                   a server response is only legitimate while its id is here.
+//   pendingClient — request ids the SERVER opened (sampling, roots,
+//                   elicitation) that we relayed to the client; the client's
+//                   response is only forwarded while its id is here.
+const pendingServer = new Map();  // id -> method
+const pendingClient = new Set();  // ids of server->client requests in flight
 
 // Log to stderr (stdout is reserved for JSON-RPC to the client)
 // All log messages are redacted to prevent secret leakage
@@ -203,7 +217,27 @@ function explainDenial(check, toolName, manifest) {
 
 // Handle a JSON-RPC message from the CLIENT (client → proxy)
 async function handleClientMessage(msg) {
-  if (msg.method === "tools/call" && msg.id != null) {
+  // A client message carrying an id but no method is a RESPONSE to a
+  // server→client request (sampling/createMessage, roots/list,
+  // elicitation/create). Forward it only if we actually relayed that request —
+  // otherwise it desynchronizes the server's pending map and is dropped.
+  if (msg.id != null && msg.method == null) {
+    if (pendingClient.delete(msg.id)) {
+      sendToServer(msg);
+    } else {
+      log(`DROP: client response id=${JSON.stringify(msg.id)} has no pending server request`);
+    }
+    return;
+  }
+
+  if (msg.method === "tools/call") {
+    // A tools/call notification (no id) can never be authorized — the gate has
+    // no response channel, but the side effect would still execute upstream.
+    // Drop it: only id-carrying tools/call requests are enforceable.
+    if (msg.id == null) {
+      log("DROP: tools/call notification — calls must carry a request id to pass the gate");
+      return;
+    }
     const toolName = msg.params?.name;
 
     // Auth: extract and validate token if auth is configured.
@@ -230,11 +264,12 @@ async function handleClientMessage(msg) {
       }
     }
 
-    const check = allowAll
-      ? { allowed: true, reason: null }
-      : driftedNames.has(toolName)
-        ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
-        : checkCall(manifest, toolName, msg.params?.arguments ?? {}, authToken);
+    // --allow-all narrows per-tool admission (unknown/dangerous tools pass)
+    // but can never bypass manifest validity, expiry, or requiredScopes —
+    // those are enforced inside checkCall regardless of mode.
+    const check = driftedNames.has(toolName) && !allowAll
+      ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
+      : checkCall(manifest, toolName, msg.params?.arguments ?? {}, authToken, { allowAll });
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
       // Build a human-readable explanation for the error response.
@@ -256,6 +291,34 @@ async function handleClientMessage(msg) {
         log(`ALLOW-ALL: dangerous tool "${toolName}" called (score=${entry.dangerScore}, confidence=${entry.dangerConfidence}) — forwarded`);
       }
     }
+
+    // Gate 2 arg enforcement: validate the call arguments against the
+    // *approved* inputSchema (embedded in the manifest; for legacy manifests,
+    // the schema observed in the latest tools/list) before forwarding.
+    const entry = manifest.tools.find((t) => t.name === toolName);
+    const schema = entry?.inputSchema ?? liveSchemas.get(toolName);
+    if (schema) {
+      const problem = validateArgs(schema, msg.params?.arguments ?? {});
+      if (problem) {
+        log(`BLOCKED tools/call: arguments violate approved inputSchema (${problem})`);
+        sendToClient({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: {
+            code: -32602,
+            message: `mcp-proxy: ${problem}`,
+            data: {
+              tool: toolName,
+              reason: "ARGS_VIOLATE_SCHEMA",
+              explanation: `Arguments for tool "${toolName}" violate the approved inputSchema: ${problem}`,
+              action: "Fix the arguments to match the approved schema, or regenerate the manifest if the schema legitimately changed.",
+            },
+          },
+        });
+        return;
+      }
+    }
+
     // Approved — strip auth metadata and forward to server
     pendingServer.set(msg.id, "tools/call");
     sendToServer(tokenValidator ? stripAuth(msg) : msg);
@@ -269,7 +332,8 @@ async function handleClientMessage(msg) {
     return;
   }
 
-  // Everything else: pass through
+  // Everything else: requests get tracked so a matching response id is
+  // expected; notifications (no id) pass through untracked.
   if (msg.id != null) {
     pendingServer.set(msg.id, msg.method || "unknown");
   }
@@ -278,12 +342,32 @@ async function handleClientMessage(msg) {
 
 // Handle a JSON-RPC message from the SERVER (server → proxy)
 function handleServerMessage(msg) {
-  if (msg.id != null && pendingServer.has(msg.id)) {
+  // A server message carrying BOTH an id and a method is a server→client
+  // REQUEST (sampling/createMessage, roots/list, elicitation/create, ping).
+  // Relay it and track the id so the client's response routes back.
+  if (msg.id != null && msg.method != null) {
+    pendingClient.add(msg.id);
+    sendToClient(msg);
+    return;
+  }
+
+  if (msg.id != null) {
+    // A server message with an id and no method is a RESPONSE/ERROR. It is
+    // only legitimate while the id is in pendingServer: the first response
+    // consumes the pending entry, and forged ids, duplicates, and late
+    // same-id messages are dropped here and NEVER reach the client.
+    if (!pendingServer.has(msg.id)) {
+      log(`DROP: server response id=${JSON.stringify(msg.id)} is not pending`);
+      return;
+    }
     const method = pendingServer.get(msg.id);
     pendingServer.delete(msg.id);
 
     if (method === "tools/list" && msg.result) {
       const liveTools = msg.result.tools || [];
+      for (const t of liveTools) {
+        if (t && typeof t.name === "string") liveSchemas.set(t.name, t.inputSchema);
+      }
       const diff = diffManifest(manifest, liveTools);
       driftedNames = new Set(diff.drifted.map((t) => t.name));
 
@@ -305,7 +389,7 @@ function handleServerMessage(msg) {
       // --strict mode: exit on any drift
       if (strictMode && !diff.ok) {
         log(`STRICT MODE: drift detected, exiting. Regenerate manifest with:`);
-        log(`  mcp-trustcard scan ${cwd ? "--cwd " + cwd + " " : ""}-- ${serverCmd} ${serverArgs.join(" ")} --save-manifest ${manifestPath}`);
+        log(`  mcp-trustcard gen-manifest ${cwd ? "--cwd " + cwd + " " : ""}--save-manifest ${manifestPath} -- ${serverCmd} ${serverArgs.join(" ")}`);
         sendToClient({
           jsonrpc: "2.0",
           id: msg.id,
@@ -367,7 +451,7 @@ function handleServerMessage(msg) {
         log(`Filtered ${blockedCount} tool(s) from response (unapproved or dangerous)`);
         // Log the regeneration command so the user knows what to do
         log(`To approve new tools, regenerate manifest:`);
-        log(`  mcp-trustcard scan ${cwd ? "--cwd " + cwd + " " : ""}-- ${serverCmd} ${serverArgs.join(" ")} --save-manifest ${manifestPath}`);
+        log(`  mcp-trustcard gen-manifest ${cwd ? "--cwd " + cwd + " " : ""}--save-manifest ${manifestPath} -- ${serverCmd} ${serverArgs.join(" ")}`);
       }
       sendToClient({
         ...msg,
@@ -380,9 +464,14 @@ function handleServerMessage(msg) {
       // Log the call for audit trail
       log(`ALLOWED tools/call (id=${msg.id})`);
     }
+
+    // The pending request consumed — forward the (first, only) response.
+    sendToClient(msg);
+    return;
   }
 
-  // Pass through to client
+  // No id: server notification — pass through (e.g. tools/list_changed,
+  // progress, log messages). Legitimate traffic must not be eaten.
   sendToClient(msg);
 }
 

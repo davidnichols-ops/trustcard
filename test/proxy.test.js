@@ -226,7 +226,7 @@ test("proxy --strict mode returns error on drift and exits", async () => {
   assert.ok(responses[2], "tools/list response received");
   assert.ok(responses[2].error, "strict mode returns error instead of filtered list");
   assert.ok(stderr.includes("STRICT MODE"), "stderr logs strict mode drift");
-  assert.ok(stderr.includes("mcp-trustcard scan"), "stderr includes regeneration command");
+  assert.ok(stderr.includes("mcp-trustcard gen-manifest"), "stderr includes regeneration command");
 });
 
 test("proxy --auto-update mode updates manifest on disk when new tools appear", async () => {

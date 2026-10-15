@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildManifest, diffManifest, checkCall, hash, canonicalJson } from "../lib/manifest.js";
+import { buildManifest, diffManifest, checkCall, hash, canonicalJson, computeManifestHash, manifestHashStatus, assertProxyManifest } from "../lib/manifest.js";
 
 test("canonicalJson sorts keys and strips whitespace", () => {
   assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
@@ -131,4 +131,72 @@ test("manifestHash is stable for same tools", () => {
   const m1 = buildManifest(tools);
   const m2 = buildManifest(tools);
   assert.equal(m1.manifestHash, m2.manifestHash);
+});
+
+// --- Regression: manifestHash covers full authorization semantics ------------
+// The hash used to cover only "name:schemaHash:allowed" — a scope change or a
+// contract drift that left inputSchema+decision untouched produced the SAME
+// manifestHash. The policy hash now covers effective scopes and the full
+// semantic contract (contractDigest).
+
+test("manifestHash changes when requiredScopes change (scopes are covered)", () => {
+  const tools = [{ name: "read_file", inputSchema: { type: "object" } }];
+  const unscoped = buildManifest(tools);
+  const scoped = buildManifest(tools, null, null, null, 90, { read_file: ["admin:read"] });
+  assert.ok(scoped.tools[0].requiredScopes);
+  assert.notEqual(unscoped.manifestHash, scoped.manifestHash);
+  // and scope *content* matters, not just presence
+  const otherScope = buildManifest(tools, null, null, null, 90, { read_file: ["admin:write"] });
+  assert.notEqual(scoped.manifestHash, otherScope.manifestHash);
+});
+
+test("manifestHash changes on allow/deny and full-contract drift (annotations, outputSchema)", () => {
+  const base = [{ name: "t", description: "d", inputSchema: { type: "object" } }];
+  const m1 = buildManifest(base);
+  // flip the decision
+  const denied = buildManifest(base);
+  denied.tools[0].allowed = !denied.tools[0].allowed;
+  denied.manifestHash = computeManifestHash(denied.tools);
+  assert.notEqual(m1.manifestHash, denied.manifestHash);
+  // contract drift beyond inputSchema (annotations/execution/outputSchema) moves the hash
+  const drifted = [{ ...base[0], annotations: { readOnlyHint: true, destructiveHint: true } }];
+  const m2 = buildManifest(drifted);
+  assert.notEqual(m1.tools[0].contractDigest, m2.tools[0].contractDigest);
+  assert.notEqual(m1.manifestHash, m2.manifestHash);
+  // description-only drift too (poisoning surface)
+  const m3 = buildManifest([{ ...base[0], description: "different wording entirely" }]);
+  assert.notEqual(m1.manifestHash, m3.manifestHash);
+});
+
+test("manifestHashStatus: v2-policy ok, legacy hash accepted, tamper detected", () => {
+  const m = buildManifest([{ name: "t", inputSchema: { type: "object" } }], null, null, null, 90, { t: ["a:b"] });
+  assert.deepEqual(manifestHashStatus(m).format, "v2-policy");
+  // legacy format (name:schemaHash:allowed) still verifies as legacy
+  const legacy = buildManifest([{ name: "t", inputSchema: { type: "object" } }]);
+  legacy.manifestHash = hash(legacy.tools.map((e) => `${e.name}:${e.schemaHash}:${e.allowed}`));
+  assert.equal(manifestHashStatus(legacy).format, "legacy-v1");
+  assert.equal(manifestHashStatus(legacy).ok, true);
+  // post-hoc scope edit on a v2 manifest is detected
+  const tampered = buildManifest([{ name: "t", inputSchema: { type: "object" } }], null, null, null, 90, { t: ["a:b"] });
+  tampered.tools[0].requiredScopes = ["*"];
+  assert.equal(manifestHashStatus(tampered).ok, false);
+  assert.equal(manifestHashStatus(tampered).format, "mismatch");
+});
+
+test("assertProxyManifest accepts intact manifests and rejects tampered ones", () => {
+  const m = buildManifest([{ name: "t", inputSchema: { type: "object" } }]);
+  assert.doesNotThrow(() => assertProxyManifest(m));
+  // legacy-format hash on a well-formed manifest still validates
+  const legacy = buildManifest([{ name: "t", inputSchema: { type: "object" } }]);
+  legacy.manifestHash = hash(legacy.tools.map((e) => `${e.name}:${e.schemaHash}:${e.allowed}`));
+  assert.doesNotThrow(() => assertProxyManifest(legacy));
+  // scope tampering is caught at the management boundary: adding a scope
+  // requirement post-hoc (or clearing one) changes the policy hash
+  const tampered = buildManifest([{ name: "t", inputSchema: { type: "object" } }], null, null, null, 90, { t: ["admin:read"] });
+  tampered.tools[0].requiredScopes = ["root:all"];
+  assert.throws(() => assertProxyManifest(tampered), /integrity failure/);
+  // missing hash fails closed
+  const noHash = buildManifest([{ name: "t", inputSchema: { type: "object" } }]);
+  delete noHash.manifestHash;
+  assert.throws(() => assertProxyManifest(noHash), /integrity failure/);
 });

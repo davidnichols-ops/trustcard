@@ -496,3 +496,86 @@ test("v2.2.1: benign 'important' in normal context is NOT flagged", () => {
   });
   assert.equal(result.score, 0, `benign 'important' should NOT be flagged, score=${result.score}, markers: ${result.markers}`);
 });
+
+// --- Remediation: shell/command-execution recognition (adversarial review) ----
+// Findings: punctuation-styled names evaded word matching, `rm` was absent from
+// the destructive verb list, and a `cmd`/`command` schema parameter alone did
+// not cross the deny threshold.
+
+test("shell exec: '-rm-rf' style name is caught even without params", () => {
+  const result = analyzeTool({
+    name: "-rm-rf",
+    description: "Filesystem cleanup utility.",
+    inputSchema: { type: "object", properties: {} },
+  });
+  assert.ok(result.isDangerous, `'-rm-rf' should be dangerous, score=${result.score}, reasons: ${result.reasons}`);
+  assert.ok(result.heuristic?.destructiveVerbs?.includes("rm") || result.reasons.some(r => /rm\b/.test(r)),
+    `expected rm to be recognized, reasons: ${result.reasons}`);
+});
+
+test("shell exec: a bare 'cmd' parameter independently crosses the deny threshold", () => {
+  const result = analyzeTool({
+    name: "utility",
+    description: "A helpful utility.",
+    inputSchema: { type: "object", properties: { cmd: { type: "string" } } },
+  });
+  assert.ok(result.isDangerous, `cmd param alone should deny, score=${result.score}, reasons: ${result.reasons}`);
+  assert.ok(result.heuristic.dangerousParams.includes("cmd"));
+});
+
+test("shell exec: 'command' parameter independently crosses the deny threshold", () => {
+  const result = analyzeTool({
+    name: "dispatcher",
+    description: "Dispatch operations.",
+    inputSchema: { type: "object", properties: { command: { type: "string" } } },
+  });
+  assert.ok(result.isDangerous, `command param alone should deny, score=${result.score}, reasons: ${result.reasons}`);
+});
+
+test("shell exec: separator-normalized params match (execCommand, exec-cmd)", () => {
+  for (const param of ["execCommand", "exec-cmd", "shell_command"]) {
+    const result = analyzeTool({
+      name: "utility",
+      description: "A helpful utility.",
+      inputSchema: { type: "object", properties: { [param]: { type: "string" } } },
+    });
+    assert.ok(result.isDangerous, `param '${param}' should mark the tool dangerous, score=${result.score}`);
+  }
+});
+
+test("shell exec: '-rm-rf' + cmd:param compound case", () => {
+  const result = analyzeTool({
+    name: "-rm-rf",
+    description: "Cleanup.",
+    inputSchema: { type: "object", properties: { cmd: { type: "string" } } },
+  });
+  assert.ok(result.isDangerous);
+  assert.ok(result.score >= 0.8, `compound case should score high, got ${result.score}`);
+});
+
+test("shell exec FP: benign names containing 'rm' are not flagged (form, inform, farms)", () => {
+  // The 'rm' verb must match only at word boundaries — "form", "informs",
+  // "farms" embed "rm" between letters and must not contribute destructiveness.
+  for (const name of ["inform_user", "farms_list"]) {
+    const result = analyzeTool({ name, description: `Utility: ${name}.`, inputSchema: { type: "object", properties: {} } });
+    assert.ok(!result.isDangerous, `${name} should NOT be dangerous, score=${result.score}, reasons: ${result.reasons}`);
+    assert.ok(!result.heuristic.destructiveVerbs.includes("rm"), `${name} must not match the rm verb`);
+  }
+  // format_cells: 'rm' inside "format" stays inert; assert at the heuristic
+  // layer so the test measures word-boundary precision, not corpus overlap.
+  const fmt = heuristicScore({ name: "format_cells", description: "Utility: format_cells." });
+  assert.ok(!fmt.destructiveVerbs.includes("rm"), `format_cells must not match the rm verb, reasons: ${fmt.reasons}`);
+});
+
+test("shell exec FP: 'command palette' UI-style tool stays below the deny line", () => {
+  const result = analyzeTool({
+    name: "command_palette",
+    description: "Show the command palette UI for selecting editor actions.",
+  });
+  assert.ok(!result.isDangerous, `command_palette should NOT be dangerous, score=${result.score}, reasons: ${result.reasons}`);
+});
+
+test("shell exec FP: 'get_status' still scores zero", () => {
+  const result = heuristicScore({ name: "get_status", description: "Get the current server status" });
+  assert.equal(result.score, 0, `get_status heuristic score should stay 0, got ${result.score}`);
+});
