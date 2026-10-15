@@ -77,6 +77,7 @@ async function runProxyTest(manifest, serverCode) {
         try {
           const msg = JSON.parse(line);
           if (msg.id != null) responses[msg.id] = msg;
+          if ([1, 2, 3, 4].every((id) => responses[id])) { clearTimeout(timeout); proxy.kill(); resolve(responses); }
         } catch {}
       }
     });
@@ -106,18 +107,13 @@ async function runProxyTest(manifest, serverCode) {
       name: "delete_everything", arguments: {}
     }}), 500);
 
-    // collect and finish after 800ms
-    setTimeout(() => {
-      clearTimeout(timeout);
-      proxy.kill();
-      resolve(responses);
-    }, 800);
+
   });
 }
 
 test("proxy forwards initialize and tools/list", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
     { name: "fake-server", version: "1.0" },
   );
   const serverCode = spawnFakeServer(["read_file"], []);
@@ -129,7 +125,7 @@ test("proxy forwards initialize and tools/list", async () => {
 
 test("proxy strips unapproved tools from tools/list", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   const serverCode = spawnFakeServer(["read_file"], ["delete_everything", "exfiltrate"]);
   const responses = await runProxyTest(manifest, serverCode);
@@ -144,7 +140,7 @@ test("proxy strips unapproved tools from tools/list", async () => {
 
 test("proxy allows calls to approved tools", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   const serverCode = spawnFakeServer(["read_file"], []);
   const responses = await runProxyTest(manifest, serverCode);
@@ -156,7 +152,7 @@ test("proxy allows calls to approved tools", async () => {
 
 test("proxy blocks calls to unapproved tools", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   const serverCode = spawnFakeServer(["read_file"], ["delete_everything"]);
   const responses = await runProxyTest(manifest, serverCode);
@@ -197,6 +193,7 @@ async function runProxyTestWithFlags(manifest, serverCode, flags, manifestPath =
         try {
           const msg = JSON.parse(line);
           if (msg.id != null) responses[msg.id] = msg;
+          if (responses[1] && responses[2]) { clearTimeout(timeout); proxy.kill(); resolve({ responses, stderr: stderrBuf }); }
         } catch {}
       }
     });
@@ -215,17 +212,13 @@ async function runProxyTestWithFlags(manifest, serverCode, flags, manifestPath =
     send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
     setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }), 200);
 
-    setTimeout(() => {
-      clearTimeout(timeout);
-      proxy.kill();
-      resolve({ responses, stderr: stderrBuf });
-    }, 800);
+
   });
 }
 
 test("proxy --strict mode returns error on drift and exits", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   const serverCode = spawnFakeServer(["read_file"], ["new_tool"]);
   const { responses, stderr } = await runProxyTestWithFlags(manifest, serverCode, ["--strict"]);
@@ -239,7 +232,7 @@ test("proxy --strict mode returns error on drift and exits", async () => {
 test("proxy --auto-update mode updates manifest on disk when new tools appear", async () => {
   const manifestPath = "/tmp/test-manifest-autoupdate.json";
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object" } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   writeFileSync(manifestPath, JSON.stringify(manifest));
   const serverCode = spawnFakeServer(["read_file"], ["new_tool"]);
@@ -260,7 +253,7 @@ test("proxy --auto-update mode updates manifest on disk when new tools appear", 
 
 test("proxy --strict mode allows through when no drift", async () => {
   const manifest = buildManifest(
-    [{ name: "read_file", inputSchema: { type: "object", properties: {} } }],
+    [{ name: "read_file", description: "tool read_file", inputSchema: { type: "object", properties: {} } }],
   );
   const serverCode = spawnFakeServer(["read_file"], []);
   const { responses, stderr } = await runProxyTestWithFlags(manifest, serverCode, ["--strict"]);

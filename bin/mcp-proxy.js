@@ -5,6 +5,7 @@
 //   mcp-proxy --manifest <file> -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --strict -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --auto-update -- <server-cmd> [args...]
+//   mcp-proxy --manifest <file> --allow-all -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --auth-secret <hex> -- <server-cmd> [args...]
 //   mcp-proxy --manifest <file> --auth-introspect <url> [--auth-client-id <id> --auth-client-secret <secret>] -- <server-cmd> [args...]
 //
@@ -22,6 +23,9 @@
 //   --strict     — exits with error on any drift (added, removed, or schema change)
 //   --auto-update — updates the manifest file on disk when new tools are detected,
 //                   then allows them through. Logs a warning for each update.
+//   --allow-all  — passes all tools through without filtering (including dangerous
+//                   ones). Still logs drift and dangerous-tool calls for audit.
+//                   Use only when you trust the upstream server.
 //
 // Auth:
 //   --auth-secret <hex>      Enable dev-mode token validation with the given HMAC secret.
@@ -37,7 +41,8 @@
 // any MCP client that speaks stdio JSON-RPC works without modification.
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { buildManifest, diffManifest, checkCall } from "../lib/manifest.js";
+import { buildManifest, diffManifest, checkCall, preserveProxyPolicy, canonicalJson } from "../lib/manifest.js";
+import { atomicWriteJson } from "../lib/fleet.js";
 import { redact } from "../lib/redact.js";
 import { DevIssuer, IdpIntrospector, TokenValidator, extractToken, stripAuth } from "../lib/auth.js";
 
@@ -46,6 +51,7 @@ const args = process.argv.slice(2);
 // Parse flags
 const strictMode = args.includes("--strict");
 const autoUpdate = args.includes("--auto-update");
+const allowAll = args.includes("--allow-all");
 const cwdIdx = args.indexOf("--cwd");
 const cwd = cwdIdx !== -1 && args[cwdIdx + 1] ? args[cwdIdx + 1] : undefined;
 
@@ -110,6 +116,7 @@ try {
 }
 
 let approvedNames = new Set(manifest.tools.map((t) => t.name));
+let driftedNames = new Set();
 
 // --- JSON-RPC plumbing ---
 // The proxy maintains two stdio pipes:
@@ -223,7 +230,11 @@ async function handleClientMessage(msg) {
       }
     }
 
-    const check = checkCall(manifest, toolName, msg.params?.arguments ?? {}, authToken);
+    const check = allowAll
+      ? { allowed: true, reason: null }
+      : driftedNames.has(toolName)
+        ? { allowed: false, reason: `tool "${toolName}" contract drifted; explicit reapproval required` }
+        : checkCall(manifest, toolName, msg.params?.arguments ?? {}, authToken);
     if (!check.allowed) {
       log(`BLOCKED tools/call: ${check.reason}`);
       // Build a human-readable explanation for the error response.
@@ -238,6 +249,12 @@ async function handleClientMessage(msg) {
         },
       });
       return;
+    }
+    if (allowAll) {
+      const entry = manifest.tools.find((t) => t.name === toolName);
+      if (entry?.allowed === false) {
+        log(`ALLOW-ALL: dangerous tool "${toolName}" called (score=${entry.dangerScore}, confidence=${entry.dangerConfidence}) — forwarded`);
+      }
     }
     // Approved — strip auth metadata and forward to server
     pendingServer.set(msg.id, "tools/call");
@@ -268,6 +285,7 @@ function handleServerMessage(msg) {
     if (method === "tools/list" && msg.result) {
       const liveTools = msg.result.tools || [];
       const diff = diffManifest(manifest, liveTools);
+      driftedNames = new Set(diff.drifted.map((t) => t.name));
 
       if (diff.added.length > 0) {
         log(`DRIFT: ${diff.added.length} new tool(s) not in manifest: ${diff.added.join(", ")}`);
@@ -302,26 +320,40 @@ function handleServerMessage(msg) {
 
       // --auto-update mode: update manifest on disk when new tools appear
       if (autoUpdate && diff.added.length > 0) {
-        const newManifest = buildManifest(liveTools, manifest.serverInfo, manifest.spec);
+        const newManifest = preserveProxyPolicy(manifest, buildManifest(liveTools, manifest.serverInfo, manifest.spec));
         try {
-          writeFileSync(manifestPath, JSON.stringify(newManifest, null, 2));
+          const original = readFileSync(manifestPath, "utf8");
+          if (canonicalJson(JSON.parse(original)) !== canonicalJson(manifest)) throw new Error("manifest changed on disk; reload policy before auto-update");
+          atomicWriteJson(manifestPath, newManifest, { expected: original });
           manifest = newManifest;
+          driftedNames.clear();
           approvedNames = new Set(newManifest.tools.map((t) => t.name));
           log(`AUTO-UPDATE: manifest updated on disk — ${diff.added.length} new tool(s) approved: ${diff.added.join(", ")}`);
           log(`  New hash: ${newManifest.manifestHash}`);
-          // In auto-update mode, allow all tools through (they're now approved)
-          sendToClient(msg);
-          return;
+          // Continue through policy filtering even after an automatic update.
         } catch (e) {
           log(`AUTO-UPDATE FAILED: could not write manifest: ${e.message}`);
           // Fall through to default filtering behavior
         }
       }
 
+      // --allow-all mode: pass all tools through without filtering
+      if (allowAll) {
+        const dangerousCount = liveTools.filter((t) => {
+          const entry = manifest.tools.find((m) => m.name === t.name);
+          return entry?.allowed === false;
+        }).length;
+        if (dangerousCount > 0) {
+          log(`ALLOW-ALL: passing through ${dangerousCount} dangerous tool(s) unfiltered`);
+        }
+        sendToClient(msg);
+        return;
+      }
+
       // Default: strip unapproved AND dangerous tools from the response
       // so the client never sees them
       const filteredTools = liveTools.filter((t) => {
-        if (!approvedNames.has(t.name)) return false;
+        if (!approvedNames.has(t.name) || driftedNames.has(t.name)) return false;
         // Also check if the tool is marked as dangerous in the manifest
         const entry = manifest.tools.find((m) => m.name === t.name);
         if (entry && entry.allowed === false) {
@@ -422,7 +454,7 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
-const modeLabel = strictMode ? "strict" : autoUpdate ? "auto-update" : "default";
+const modeLabel = strictMode ? "strict" : autoUpdate ? "auto-update" : allowAll ? "allow-all" : "default";
 const authLabel = tokenValidator
   ? `auth: ${authSecret ? "dev-issuer" : ""}${authIntrospectUrl ? "idp-introspect" : ""}`
   : "auth: off";

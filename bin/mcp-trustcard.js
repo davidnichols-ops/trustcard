@@ -30,7 +30,7 @@ import { printFingerprint, printDiff } from "../lib/report.js";
 import { EvidenceStore } from "../lib/evidence-store.js";
 import { EVIDENCE_LAYERS } from "../lib/evidence-predicates.js";
 import { BehaviorEngine, SandboxRuntime, InputGenerator, OutputComparator, RegressionCorpus, ReferenceObservation } from "../lib/behavior.js";
-import { resolve as resolvePath, dirname, isAbsolute } from "node:path";
+import { resolve as resolvePath, dirname, isAbsolute, basename } from "node:path";
 
 const exec = promisify(execCb);
 
@@ -50,7 +50,7 @@ function opt(name, fallback = undefined) {
   return i !== -1 ? argv[i + 1] : fallback;
 }
 function positional(skip = 1) {
-  const VALUE_FLAGS = new Set(["--manifest", "--out", "--key", "--pins", "--spec", "--json-out", "--batch", "--env-file", "--cwd", "--save-manifest", "--threshold", "--parallel", "--timeout", "--subject", "--predicate", "--since", "--until", "--layer", "--evidence-dir", "--server", "--corpus", "--seed", "--probe", "--tool", "--implementation", "--namespace", "--expires-in", "--claims", "--publisher-name"]);
+  const VALUE_FLAGS = new Set(["--interval", "--config", "--url", "--within", "--port", "--manifest", "--out", "--key", "--pins", "--spec", "--json-out", "--batch", "--env-file", "--cwd", "--save-manifest", "--threshold", "--parallel", "--timeout", "--subject", "--predicate", "--since", "--until", "--layer", "--evidence-dir", "--server", "--corpus", "--seed", "--probe", "--tool", "--implementation", "--namespace", "--expires-in", "--claims", "--publisher-name"]);
   const out = [];
   for (let i = skip; i < argv.length; i++) {
     const a = argv[i];
@@ -63,6 +63,14 @@ function positional(skip = 1) {
 
 function usage() {
   console.log(`mcp-trustcard — cryptographic trust infrastructure for MCP servers
+
+Fleet operations (JSON client configs):
+  mcp-trustcard status --config <file> [--json]
+  mcp-trustcard renew --config <file> [--server <name>] [--within <days>] [--dry-run] [--json]
+  mcp-trustcard reapprove --config <file> [--server <name>] [--dry-run] [--json]
+  mcp-trustcard reapprove <manifest.json> --url <endpoint> [--dry-run] [--json]
+  mcp-trustcard console --config <file> [--port <port>]
+  mcp-trustcard watch --config <file> [--within 14] [--interval 21600] [--once]
 
 Identity & provenance:
   mcp-trustcard fingerprint <spec> [--manifest m.json] [--json]
@@ -1281,6 +1289,66 @@ async function cmdDescriptorPin() {
   console.log(`  store:     ${dim(pins.path)}`);
 }
 
+// renew: re-attest gated servers and extend manifest expiry if nothing changed.
+//   mcp-trustcard renew --config <client-config.json> [--within <days>] [--expires-in <days>] [--dry-run] [--json]
+//   mcp-trustcard renew <manifest.json> [--expires-in <days>] [--dry-run] -- <server-cmd> [args...]
+async function cmdRenew(reapprove = false) {
+  const fleet = await import("../lib/fleet.js");
+  const days = opt("--expires-in") != null ? Number(opt("--expires-in")) : 90;
+  const within = opt("--within") != null ? Number(opt("--within")) : null;
+  if (!Number.isFinite(days) || days <= 0 || (within != null && (!Number.isFinite(within) || within < 0))) { console.error("expiry must be positive and --within nonnegative (finite days)"); process.exitCode = 2; return; }
+  const dryRun = argv.includes("--dry-run");
+  const asJson = argv.includes("--json");
+  const configPath = opt("--config");
+  let targets;
+  if (configPath) {
+    targets = fleet.listGated(configPath).gated;
+    const only = opt("--server");
+    if (only) targets = targets.filter((t) => t.name === only);
+  } else {
+    const manifestPath = positional(1)[0];
+    const local = parseLocalCommand(argv.slice(1));
+    const url = opt("--url");
+    if (!manifestPath || (!local && !url)) { console.error("renew: need --config <file> or <manifest.json> -- <server-cmd>"); process.exit(2); }
+    targets = [{ name: basename(manifestPath, ".json"), manifest: manifestPath, cmd: local?.cmd, args: local?.args, url, env: runtimeOpts().injectedEnv, cwd: opt("--cwd") }];
+  }
+  if (!targets.length) { console.error("no matching gated servers"); process.exitCode = 2; return; }
+  const results = [];
+  for (const t of targets) {
+    try { results.push(await (reapprove ? fleet.reapproveServer : fleet.renewServer)(t, { days, dryRun, onlyIfWithinDays: within })); }
+    catch (e) { results.push({ name: t.name, ok: false, action: "error", reason: e.message }); }
+  }
+  if (asJson) console.log(JSON.stringify({ results }, null, 2));
+  else for (const r of results) {
+    const mark = r.action === "renewed" || r.action === "would-renew" ? "✓" : r.action === "skipped" ? "·" : "✗";
+    console.log(`${mark} ${r.name.padEnd(22)} ${r.action.padEnd(12)} ${r.expiresAt ?? r.reason ?? ""}`);
+  }
+  if (results.some((r) => !r.ok)) process.exitCode = 1;
+}
+
+// status: what is gated, what isn't, and when gates expire.
+//   mcp-trustcard status --config <client-config.json> [--json]
+async function cmdStatus() {
+  const fleet = await import("../lib/fleet.js");
+  const configPath = opt("--config");
+  if (!configPath) { console.error("status: missing --config <client-config.json>"); process.exit(2); }
+  const { gated, ungated } = fleet.listGated(configPath);
+  const rows = gated.map((g) => {
+    if (!g.manifest || !existsSync(g.manifest)) return { name: g.name, gated: true, state: "missing-manifest" };
+    let m;
+    try { m = JSON.parse(readFileSync(g.manifest, "utf8")); if (!Array.isArray(m.tools)) throw new Error("missing tools"); }
+    catch (e) { return { name: g.name, gated: true, state: "invalid-manifest", reason: e.message }; }
+    const s = fleet.manifestStatus(m);
+    return { name: g.name, gated: true, ...s, expiresAt: m.expiresAt, tools: m.tools.length, blocked: m.tools.filter((t) => !t.allowed).length, overrides: m.tools.filter((t) => t.manualOverride).length, signaturePresent: !!m.signature, signatureVerified: false };
+  });
+  const out = { config: configPath, gated: rows, ungated };
+  if (rows.some((r) => ["expired", "missing-manifest", "invalid-manifest", "invalid-expiry"].includes(r.state))) process.exitCode = 1;
+  if (argv.includes("--json")) { console.log(JSON.stringify(out, null, 2)); return; }
+  for (const r of rows) console.log(`  ${r.state === "ok" ? "✓" : r.state === "expiring" ? "!" : "✗"} ${r.name.padEnd(22)} ${String(r.state).padEnd(10)} ${r.daysLeft ?? ""}d  tools=${r.tools ?? "?"} blocked=${r.blocked ?? "?"} overrides=${r.overrides ?? "?"}`);
+  for (const u of ungated) console.log(`  - ${u.name.padEnd(22)} UNGATED (${u.transport})`);
+  if (rows.some((r) => r.state === "expired" || r.state === "missing-manifest")) process.exitCode = 1;
+}
+
 async function main() {
   const cmd = argv[0];
   if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") return usage();
@@ -1288,6 +1356,23 @@ async function main() {
     case "scan": return cmdScan();
     case "scan-config": return cmdScanConfig();
     case "gen-manifest": return cmdGenManifest();
+    case "renew": return cmdRenew();
+    case "reapprove": return cmdRenew(true);
+    case "status": return cmdStatus();
+    case "watch": {
+      const configPath = opt("--config");
+      if (!configPath) throw new Error("watch: --config <JSON file> required");
+      const { watchFleet } = await import("../lib/renewal.js");
+      return watchFleet(configPath, { intervalSeconds: opt("--interval") != null ? Number(opt("--interval")) : 21600, within: opt("--within") != null ? Number(opt("--within")) : 14, days: opt("--expires-in") != null ? Number(opt("--expires-in")) : 90, once: flag("--once") });
+    }
+    case "console": {
+      const configPath = opt("--config");
+      if (!configPath) throw new Error("console: --config <JSON file> required");
+      const { startConsole } = await import("../lib/console.js");
+      const server = await startConsole({ configPath, port: opt("--port") != null ? Number(opt("--port")) : 0 });
+      console.log(`Trustcard console: http://127.0.0.1:${server.address().port}`);
+      return;
+    }
     case "inspect": return cmdInspect();
     case "fingerprint": return cmdFingerprint();
     case "manifest": return cmdManifest();
