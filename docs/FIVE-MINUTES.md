@@ -86,25 +86,18 @@ mcp-proxy --manifest policy.json -- npx -y @modelcontextprotocol/server-filesyst
 mcp-http-proxy --manifest policy.json --upstream https://api.example.com/mcp --port 8080
 ```
 
-## 5. Emit and query evidence (1 minute)
+## 5. Verify the gate (1 minute)
 
-Run an ecosystem scan that stores evidence records:
+Inspect the exact policy the proxy enforces, then exercise the configured
+route from your MCP client:
 
 ```bash
-# Scan 100 servers and store evidence
-node scripts/scan-ecosystem.mjs --sample 100 --existence-only \
-  --evidence-store data/evidence \
-  --registry-file data/mcp-registry-2026-07-27.json
-
-# Verify evidence integrity
-mcp-trustcard evidence verify --evidence-dir data/evidence
-
-# View stats
-mcp-trustcard evidence stats --evidence-dir data/evidence
-
-# Query a specific server's history
-mcp-trustcard evidence history --subject io.github.brave/brave-search-mcp-server --evidence-dir data/evidence
+mcp-trustcard inspect policy.json
+mcp-trustcard status --config /absolute/path/client-config.json
 ```
+
+`scan` produces a scorecard; it does not write to the evidence store. Evidence
+commands operate on records created explicitly by evidence-producing workflows.
 
 ---
 
@@ -114,7 +107,7 @@ mcp-trustcard evidence history --subject io.github.brave/brave-search-mcp-server
 - A **signed manifest** that cryptographically identifies a server's capabilities
 - A **TOFU pin** that detects if the server changes
 - An **enforcement proxy** that blocks dangerous tools and unauthorized calls
-- An **evidence store** with verifiable observations about the MCP ecosystem
+- A concrete policy you can inspect and verify through the configured route
 
 ## Next steps
 
@@ -136,10 +129,11 @@ graph TD
     F[Server Spec] --> G[Health Scan]
     G --> H[Scorecard]
     
-    F --> I[Manifest Gen]
-    I --> J[Sign]
-    J --> K[Pin TOFU]
-    J --> L[Proxy Enforcement]
+    F --> I[Provenance Manifest]
+    I --> J[Sign and Verify Publisher]
+    F --> K[Pin TOFU]
+    F --> Q[Proxy Policy Gen]
+    Q --> L[Proxy Enforcement]
     L --> M[Gate 1: Trust State]
     L --> N[Gate 2: Invocation Policy]
     

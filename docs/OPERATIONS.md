@@ -1,6 +1,6 @@
-# Operations release candidate — 3.2.0-rc.1
+# Operations — 3.2.0
 
-Trustcard operations adds a reusable agent skill, four config-bound operations MCP tools, a local read-only console and policy-preserving fleet renewal/reapproval. It is a local release candidate, not a general enterprise production certification. The published 3.1.0 package may not include these commands; use the accompanying candidate tarball until a release is approved.
+Trustcard operations adds a reusable agent skill, four config-bound operations MCP tools, a local read-only console and policy-preserving fleet renewal/reapproval. These features ship in 3.2.0; this remains an operations toolkit rather than a general enterprise production certification.
 
 See [the skill](../skills/trustcard-operations/SKILL.md) for the operational workflow, [client integration](../skills/trustcard-operations/references/clients.md) for supported config/transport boundaries, and [enterprise integration](../skills/trustcard-operations/references/enterprise.md) for the planned control-plane architecture and acceptance gates.
 

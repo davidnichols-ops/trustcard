@@ -40,8 +40,10 @@ BRUCE_LEE_LOG_PATH=/tmp/audit.jsonl \
 node bin/mcp-trustcard.js scan -- node examples/bruce-lee/server.js
 ```
 
-Expected score: **87/100** (PASS on handshake, schema validity, destructive
-capabilities, authentication, protocol version, latency).
+Expected score: **68/75**. npm installability does not apply to a local
+command, and a single probe cannot prove the absence of secret exposure, so
+both checks are excluded from the denominator. Authentication is WARN because
+the local stdio server accepts any caller that can reach its transport.
 
 ### Generate a manifest
 

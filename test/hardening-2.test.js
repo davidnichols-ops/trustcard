@@ -85,6 +85,44 @@ test("A: backtick substitution in a spec is a literal npm argument, not a comman
   assert.equal(existsSync(marker), false);
 });
 
+test("A: failed npm lookup stops before spawn and excludes unrun checks", async () => {
+  const r = await runHealthcheck("missing-package", {
+    checkInstallability: async () => ({
+      status: "FAIL", detail: "npm view failed: 404", score: 0, max: 15,
+      meta: { lookupFailed: true },
+    }),
+  });
+  assert.equal(r.lookupFailed, true);
+  assert.equal(r.checks.handshake.status, "FAIL");
+  assert.match(r.checks.handshake.detail, /not spawned/);
+  assert.equal(r.max, 15);
+  assert.equal(r.score, 0);
+});
+
+test("A: npm package without a bin is classified as non-runnable, not config-required", async () => {
+  const r = await runHealthcheck("ordinary-library", {
+    checkInstallability: async () => ({
+      status: "WARN", detail: "ordinary-library@1.0.0 (no bin)", score: 10, max: 15,
+      meta: { name: "ordinary-library", version: "1.0.0", noBin: true },
+    }),
+  });
+  assert.equal(r.nonRunnable, true);
+  assert.equal(r.configRequired, undefined);
+  assert.equal(r.checks.handshake.status, "SKIPPED");
+  assert.equal(r.checks.authentication.status, "UNKNOWN");
+  assert.doesNotMatch(r.checks.authentication.detail, /requires config/);
+  assert.equal(r.max, 15);
+});
+
+test("E: local scan excludes npm installability and unproven secret absence from denominator", async () => {
+  const r = await runHealthcheck(fixtureCmd("stable"));
+  assert.equal(r.checks.installability.status, "SKIPPED");
+  assert.equal(r.checks.installability.max, 0);
+  assert.equal(r.checks.secretExposure.status, "UNKNOWN");
+  assert.equal(r.checks.secretExposure.max, 0);
+  assert.equal(r.max, 75);
+});
+
 test("A: fingerprint packageIdentity rejects hostile specs without executing them", async (t) => {
   const dir = tmpdirFor(t);
   const marker = join(dir, "pwned");

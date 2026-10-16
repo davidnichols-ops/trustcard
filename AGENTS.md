@@ -12,7 +12,7 @@ Read `docs/INDEX.md` first, then `docs/SECURITY-MODEL.md`, `docs/SPEC.md`, and `
 
 ## Commands
 
-- Test: `npm test` → `node --test test/*.test.js` (626 tests, all should pass)
+- Test: `npm test` → `node --test test/*.test.js` (629 tests, all should pass)
   - IMPORTANT: the `test/*.test.js` glob is required. Bare `node --test`
     also matches `test/helpers.js` and the fixture servers, which hang the
     runner (child processes keep stdio open). Don't "simplify" the glob away.
