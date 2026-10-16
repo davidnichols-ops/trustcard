@@ -156,7 +156,10 @@ test("stdio proxy: forged/duplicate/late server response ids are dropped, never 
       // asserts inside this IIFE — its promise is unawaited; failures are
       // checked against `messages`/`lastProbeId` below.
       (async () => {
-        if (!(await until(() => messages.some((m) => m.id === "srv-9"), 9000))) return resolve();
+        // Wait for every scheduled client request as well as the server's
+        // request. Waiting only for srv-9 could finish before request 3's
+        // 300ms timer had fired under a fast local run.
+        if (!(await until(() => [1, 2, 3].every((id) => messages.some((m) => m.id === id)) && messages.some((m) => m.id === "srv-9"), 9000))) return resolve();
         for (let probeId = 4; probeId <= 9; probeId++) {
           lastProbeId = probeId;
           send({ jsonrpc: "2.0", id: probeId, method: "tools/call", params: { name: "did_client_respond", arguments: {} } });
@@ -518,11 +521,16 @@ test("http proxy: malformed tools/call args rejected (-32602); expired manifest 
   });
   const upstream = await new Promise((resolve) => server.listen(0, () => resolve({ server, url: `http://localhost:${server.address().port}` })));
 
-  const post = async (port, method, params) => (await (await fetch(`http://localhost:${port}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-  })).json());
+  const post = async (port, method, params) => {
+    const response = await fetch(`http://localhost:${port}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const text = await response.text();
+    assert.ok(text, `proxy returned an empty HTTP ${response.status} response for ${method}`);
+    return JSON.parse(text);
+  };
 
   // Schema enforcement on a fresh manifest.
   {

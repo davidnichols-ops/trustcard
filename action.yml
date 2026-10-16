@@ -15,7 +15,7 @@ inputs:
   package-version:
     description: "Published npm version of mcp-trustcard to run. Pinned on purpose — bump deliberately, never @latest."
     required: false
-    default: "3.1.0"
+    default: "3.2.0"
   json-out:
     description: "Path to write the JSON report. Optional."
     required: false

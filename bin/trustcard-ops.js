@@ -20,7 +20,7 @@ const tools = [
 async function handle(msg) {
   if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string' || Array.isArray(msg)) throw Object.assign(new Error('invalid request'), { code: -32600 });
   if (msg.id == null) return undefined;
-  if (msg.method === 'initialize') return { protocolVersion: '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'trustcard-operations', version: '3.2.0-rc.1' } };
+  if (msg.method === 'initialize') return { protocolVersion: '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'trustcard-operations', version: '3.2.0' } };
   if (msg.method === 'ping') return {};
   if (msg.method === 'tools/list') return { tools };
   if (msg.method !== 'tools/call') throw Object.assign(new Error('method not found'), { code: -32601 });

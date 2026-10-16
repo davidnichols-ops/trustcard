@@ -9,7 +9,7 @@ Turn the user's requested MCP access into a working, verifiable gate without ask
 
 ## Prerequisite and discovery
 
-This package requires **mcp-trustcard 3.2.0-rc.1 or a later compatible release** for fleet commands, the console and `trustcard-ops`. Check the installed CLI's help and package version. Do not assume npm's current stable release contains these features. If using the accompanying release tarball, install that local artifact in an isolated prefix, then use its absolute executable path. Use a supported Node runtime (18 or later); inspect the actual executable instead of assuming a version-manager path works in background services.
+This package requires **mcp-trustcard 3.2.0 or a later compatible release** for fleet commands, the console and `trustcard-ops`. Check the installed CLI's help and package version. Use a supported Node runtime (18 or later); inspect the actual executable instead of assuming a version-manager path works in background services.
 
 Read the relevant client config and preserve existing entries. Never print environment values, bearer tokens, secret files or whole credential-bearing configs. Identify wrapped and direct connections separately. Start with:
 
